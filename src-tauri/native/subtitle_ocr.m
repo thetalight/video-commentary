@@ -67,14 +67,16 @@ static NSUInteger VCEditDistance(NSString *left, NSString *right) {
     return result;
 }
 
-static BOOL VCSimilar(NSString *left, NSString *right) {
+static BOOL VCNearReading(NSString *left, NSString *right) {
     NSString *a = VCNormalized(left);
     NSString *b = VCNormalized(right);
     if (a.length == 0 || b.length == 0) return NO;
     if ([a isEqualToString:b]) return YES;
     NSUInteger longest = MAX(a.length, b.length);
-    if (longest <= 3) return NO;
-    return (double)VCEditDistance(a, b) / (double)longest <= 0.18;
+    if (longest <= 2) return NO;
+    NSUInteger distance = VCEditDistance(a, b);
+    if (longest <= 12) return distance <= 1;
+    return (double)distance / (double)longest <= 0.34;
 }
 
 static BOOL VCHasText(NSString *value) { return VCNormalized(value).length >= 2; }
@@ -101,17 +103,40 @@ static NSDictionary *VCRecognize(CGImageRef image, VNRecognizeTextRequest *reque
                    : NSOrderedDescending;
     }];
     NSMutableArray<NSString *> *lines = [NSMutableArray array];
+    NSMutableArray<NSDictionary *> *alts = [NSMutableArray array];
     float confidence = 0;
+    CGRect unionBox = CGRectNull;
     for (VNRecognizedTextObservation *observation in observations) {
-        VNRecognizedText *candidate = [observation topCandidates:1].firstObject;
-        if (!candidate || candidate.confidence < 0.35 || !VCHasText(candidate.string)) continue;
-        [lines addObject:candidate.string];
-        confidence += candidate.confidence;
+        CGRect box = observation.boundingBox;
+        if (CGRectGetMidY(box) > 0.22 || CGRectGetHeight(box) > 0.14) continue;
+        NSArray<VNRecognizedText *> *candidates = [observation topCandidates:3];
+        VNRecognizedText *primary = candidates.firstObject;
+        if (!primary || primary.confidence < 0.35 || !VCHasText(primary.string)) continue;
+        [lines addObject:primary.string];
+        confidence += primary.confidence;
+        unionBox = CGRectIsNull(unionBox) ? box : CGRectUnion(unionBox, box);
+        for (NSUInteger index = 1; index < candidates.count; index++) {
+            VNRecognizedText *alternate = candidates[index];
+            if (alternate.confidence < 0.35 || !VCHasText(alternate.string)) continue;
+            if (!VCNearReading(primary.string, alternate.string)) continue;
+            [alts addObject:@{
+                @"text" : alternate.string,
+                @"confidence" : @(alternate.confidence)
+            }];
+        }
     }
     if (lines.count == 0) return @{ @"text" : @"", @"confidence" : @0 };
     NSString *text = [[lines componentsJoinedByString:@" "]
         stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
-    return @{ @"text" : text, @"confidence" : @(confidence / lines.count) };
+    return @{
+        @"text" : text,
+        @"confidence" : @(confidence / lines.count),
+        @"x" : @(CGRectGetMinX(unionBox)),
+        @"y" : @(CGRectGetMinY(unionBox)),
+        @"w" : @(CGRectGetWidth(unionBox)),
+        @"h" : @(CGRectGetHeight(unionBox)),
+        @"alts" : alts
+    };
 }
 
 static BOOL VCProbe(double duration, AVAssetImageGenerator *generator, VNRecognizeTextRequest *request) {
@@ -205,7 +230,7 @@ int main(int argc, const char *argv[]) {
         request.recognitionLevel = VNRequestTextRecognitionLevelAccurate;
         request.usesLanguageCorrection = YES;
         request.minimumTextHeight = 0.018;
-        request.regionOfInterest = CGRectMake(0.04, 0.0, 0.92, 0.48);
+        request.regionOfInterest = CGRectMake(0.06, 0.0, 0.88, 0.28);
         NSArray<NSString *> *supported = [VNRecognizeTextRequest supportedRecognitionLanguagesForTextRecognitionLevel:VNRequestTextRecognitionLevelAccurate revision:request.revision error:nil];
         NSArray<NSString *> *preferred = @[ @"zh-Hans", @"zh-Hant", @"ja-JP", @"ko-KR", @"en-US" ];
         NSMutableArray<NSString *> *selected = [NSMutableArray array];
@@ -219,9 +244,7 @@ int main(int argc, const char *argv[]) {
         }
 
         NSInteger total = (NSInteger)ceil(duration / interval);
-        NSMutableArray<VCCaption *> *captions = [NSMutableArray array];
-        VCCaption *active = nil;
-        double lastSeen = 0;
+        NSMutableArray<NSDictionary *> *samples = [NSMutableArray array];
         for (NSInteger index = 0; index < total; index++) {
             @autoreleasepool {
                 double second = MIN(duration - 0.01, index * interval);
@@ -231,27 +254,9 @@ int main(int argc, const char *argv[]) {
                 NSString *text = recognized[@"text"];
                 float confidence = [recognized[@"confidence"] floatValue];
                 if (VCHasText(text) && confidence >= 0.38) {
-                    if (active && VCSimilar(active.text, text)) {
-                        if (text.length > active.text.length || confidence > active.confidence + 0.08) active.text = text;
-                        active.confidence = MAX(active.confidence, confidence);
-                        active.end = MIN(duration, second + interval);
-                        lastSeen = second;
-                    } else {
-                        if (active) {
-                            active.end = MAX(active.start + 0.4, MIN(active.end, second));
-                            [captions addObject:active];
-                        }
-                        active = [VCCaption new];
-                        active.start = second;
-                        active.end = MIN(duration, second + interval);
-                        active.text = text;
-                        active.confidence = confidence;
-                        lastSeen = second;
-                    }
-                } else if (active && second - lastSeen >= interval) {
-                    active.end = MAX(active.start + 0.4, MIN(duration, lastSeen + interval));
-                    [captions addObject:active];
-                    active = nil;
+                    NSMutableDictionary *sample = [recognized mutableCopy];
+                    sample[@"t"] = @(second);
+                    [samples addObject:sample];
                 }
                 if (index % 20 == 0) {
                     VCProgress(5 + 92.0 * index / MAX(total, 1),
@@ -259,19 +264,23 @@ int main(int argc, const char *argv[]) {
                 }
             }
         }
-        if (active) [captions addObject:active];
-        NSArray<VCCaption *> *filtered = [VCRemoveStaticOverlays(captions) filteredArrayUsingPredicate:[NSPredicate predicateWithBlock:^BOOL(VCCaption *caption, NSDictionary *bindings) {
-            return VCHasText(caption.text) && caption.end - caption.start >= 0.35;
-        }]];
         NSInteger minimum = duration >= 1200 ? 30 : MAX(5, (NSInteger)(duration / 240));
         NSMutableIndexSet *quarters = [NSMutableIndexSet indexSet];
-        for (VCCaption *caption in filtered) [quarters addIndex:MIN(3, (NSUInteger)((caption.start / duration) * 4))];
-        if (filtered.count < minimum || (duration >= 1200 && quarters.count < 3)) {
+        for (NSDictionary *sample in samples) {
+            double start = [sample[@"t"] doubleValue];
+            [quarters addIndex:MIN(3, (NSUInteger)((start / duration) * 4))];
+        }
+        if (samples.count < minimum || (duration >= 1200 && quarters.count < 3)) {
             VCProgress(100, @"画面文字不足以构成连续字幕，已放弃 OCR 结果");
             return 3;
         }
-        if (!VCWriteSRT(filtered, outputPath)) return 2;
-        VCProgress(100, [NSString stringWithFormat:@"画面硬字幕识别完成，共 %lu 条", (unsigned long)filtered.count]);
+        NSString *observationsPath = [[outputPath stringByDeletingPathExtension]
+            stringByAppendingString:@".observations.json"];
+        NSData *data = [NSJSONSerialization dataWithJSONObject:samples options:0 error:nil];
+        [[NSFileManager defaultManager] createDirectoryAtPath:observationsPath.stringByDeletingLastPathComponent
+                                  withIntermediateDirectories:YES attributes:nil error:nil];
+        if (!data || ![data writeToFile:observationsPath atomically:YES]) return 2;
+        VCProgress(100, [NSString stringWithFormat:@"画面采样完成，共 %lu 帧，等待多帧投票", (unsigned long)samples.count]);
         return 0;
     }
 }

@@ -232,6 +232,33 @@ pub fn assess_quality(entries: &[SubtitleEntry]) -> SubtitleQuality {
         reasons.push("过多字幕行缺少有效对白信息".to_string());
         penalty = penalty.saturating_add(30);
     }
+    let adjacent = entries.windows(2).filter(|pair| {
+        let gap = time_to_secs(&pair[1].start) - time_to_secs(&pair[0].end);
+        let brief = |entry: &SubtitleEntry| {
+            time_to_secs(&entry.end) - time_to_secs(&entry.start) <= 0.8
+        };
+        (-0.2..=2.6).contains(&gap)
+            && brief(&pair[0])
+            && brief(&pair[1])
+            && ocr_texts_match(&pair[0].text, &pair[1].text)
+            && normalize_ocr_text(&pair[0].text) != normalize_ocr_text(&pair[1].text)
+    }).count();
+    if entries.len() > 1 && adjacent as f64 / (entries.len() - 1) as f64 > 0.12 {
+        reasons.push("相邻字幕仍是同一句的不同识别结果".to_string());
+        penalty = penalty.saturating_add(30);
+    }
+    let overlays = entries
+        .iter()
+        .filter(|entry| is_disposable_overlay(&entry.text))
+        .count();
+    let cjk_lines = entries
+        .iter()
+        .filter(|entry| entry.text.chars().any(is_cjk))
+        .count();
+    if cjk_lines * 2 > entries.len() && overlays >= 8 && overlays as f64 / line_count > 0.12 {
+        reasons.push("字幕混入片名、画面文字或演职员表".to_string());
+        penalty = penalty.saturating_add(25);
+    }
 
     SubtitleQuality {
         needs_retranscription: !reasons.is_empty(),
@@ -334,27 +361,54 @@ fn ocr_texts_match(left: &str, right: &str) -> bool {
         return true;
     }
     let longest = left.chars().count().max(right.chars().count());
-    longest > 2 && ocr_edit_distance(&left, &right) * 4 <= longest
+    if longest <= 2 {
+        return false;
+    }
+    let distance = ocr_edit_distance(&left, &right);
+    if longest <= 12 {
+        return distance <= 1;
+    }
+    distance * 3 <= longest
 }
 
 fn merge_similar_ocr_cues(entries: &[SubtitleEntry]) -> Vec<SubtitleEntry> {
-    let mut merged: Vec<SubtitleEntry> = Vec::new();
+    let mut clusters: Vec<Vec<SubtitleEntry>> = Vec::new();
     for entry in entries {
-        let can_extend = merged.last().is_some_and(|active| {
+        let can_extend = clusters.last().is_some_and(|cluster| {
+            let active = cluster.last().expect("cluster is not empty");
             let gap = time_to_secs(&entry.start) - time_to_secs(&active.end);
             (-0.2..=2.6).contains(&gap) && ocr_texts_match(&active.text, &entry.text)
         });
         if can_extend {
-            let active = merged.last_mut().expect("cluster exists");
-            if entry.text.chars().count() > active.text.chars().count() {
-                active.text = entry.text.clone();
-            }
-            active.end = entry.end.clone();
+            clusters
+                .last_mut()
+                .expect("cluster exists")
+                .push(entry.clone());
         } else {
-            merged.push(entry.clone());
+            clusters.push(vec![entry.clone()]);
         }
     }
-    merged
+    clusters.into_iter().filter_map(vote_text_cluster).collect()
+}
+
+fn vote_text_cluster(cluster: Vec<SubtitleEntry>) -> Option<SubtitleEntry> {
+    let mut counts: HashMap<String, (usize, usize, String)> = HashMap::new();
+    for (offset, entry) in cluster.iter().enumerate() {
+        let key = normalize_ocr_text(&entry.text);
+        let record = counts.entry(key).or_insert((0, offset, entry.text.clone()));
+        record.0 += 1;
+        record.1 = offset;
+        record.2 = entry.text.clone();
+    }
+    let winner = counts.into_values().max_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then(left.1.cmp(&right.1))
+    })?;
+    let mut chosen = cluster.first()?.clone();
+    chosen.text = winner.2;
+    chosen.end = cluster.last()?.end.clone();
+    Some(chosen)
 }
 
 fn is_ocr_overlay(text: &str) -> bool {
@@ -399,6 +453,113 @@ fn trim_ocr_overlays(entries: &[SubtitleEntry]) -> Vec<SubtitleEntry> {
         kept.truncate(index);
     }
     kept
+}
+
+#[derive(Debug, Deserialize)]
+struct OcrAltJson {
+    text: String,
+    confidence: f32,
+}
+
+#[derive(Debug, Deserialize)]
+struct OcrObservationJson {
+    t: f64,
+    text: String,
+    confidence: f32,
+    #[serde(default)]
+    alts: Vec<OcrAltJson>,
+}
+
+pub fn entries_from_ocr_observations(
+    raw: &str,
+    interval: f64,
+) -> Result<Vec<SubtitleEntry>, String> {
+    let frames: Vec<OcrObservationJson> =
+        serde_json::from_str(raw).map_err(|error| format!("无法解析画面采样：{error}"))?;
+    Ok(vote_ocr_frames(&frames, interval))
+}
+
+fn vote_ocr_frames(frames: &[OcrObservationJson], interval: f64) -> Vec<SubtitleEntry> {
+    let mut clusters: Vec<Vec<&OcrObservationJson>> = Vec::new();
+    for frame in frames {
+        if frame.text.trim().is_empty() || frame.confidence < 0.38 {
+            continue;
+        }
+        let can_extend = clusters.last().is_some_and(|cluster| {
+            let active = cluster.last().expect("cluster is not empty");
+            let gap = frame.t - active.t;
+            (0.0..=2.6).contains(&gap) && ocr_texts_match(&active.text, &frame.text)
+        });
+        if can_extend {
+            clusters.last_mut().expect("cluster exists").push(frame);
+        } else {
+            clusters.push(vec![frame]);
+        }
+    }
+    let entries = clusters
+        .into_iter()
+        .filter_map(|cluster| vote_frame_cluster(&cluster, interval))
+        .collect::<Vec<_>>();
+    reindex_entries(trim_ocr_overlays(&entries))
+}
+
+fn vote_frame_cluster(cluster: &[&OcrObservationJson], interval: f64) -> Option<SubtitleEntry> {
+    let mut scores: HashMap<String, (u32, f32, f64, String)> = HashMap::new();
+    for frame in cluster {
+        add_reading(&mut scores, &frame.text, frame.confidence, frame.t, true);
+        for alternate in &frame.alts {
+            add_reading(
+                &mut scores,
+                &alternate.text,
+                alternate.confidence * 0.5,
+                frame.t,
+                false,
+            );
+        }
+    }
+    let winner = scores.into_values().max_by(|left, right| {
+        left.0.cmp(&right.0).then(
+            left.1
+                .partial_cmp(&right.1)
+                .unwrap_or(std::cmp::Ordering::Equal),
+        ).then(
+            left.2
+                .partial_cmp(&right.2)
+                .unwrap_or(std::cmp::Ordering::Equal),
+        )
+    })?;
+    let start = cluster.first()?.t;
+    let end = cluster.last()?.t + interval.max(0.4);
+    Some(SubtitleEntry {
+        index: 1,
+        start: secs_to_time(start),
+        end: secs_to_time(end),
+        text: winner.3,
+    })
+}
+
+fn add_reading(
+    scores: &mut HashMap<String, (u32, f32, f64, String)>,
+    text: &str,
+    confidence: f32,
+    time: f64,
+    primary: bool,
+) {
+    let key = normalize_ocr_text(text);
+    if key.is_empty() {
+        return;
+    }
+    let record = scores
+        .entry(key)
+        .or_insert((0, 0.0, time, text.trim().to_string()));
+    if primary {
+        record.0 += 1;
+    }
+    record.1 += confidence;
+    if time >= record.2 {
+        record.2 = time;
+        record.3 = text.trim().to_string();
+    }
 }
 
 fn reindex_entries(entries: Vec<SubtitleEntry>) -> Vec<SubtitleEntry> {
@@ -559,7 +720,28 @@ mod tests {
                 .count(),
             1
         );
-        assert_eq!(text.matches("我丈夫是入殓师").count(), 1);
+        assert_eq!(text.matches("我文夫是入殓师").count(), 1);
+    }
+
+    #[test]
+    fn observation_vote_prefers_repeated_high_confidence_reading() {
+        let raw = r#"[
+            {"t":29.25,"text":"入验的时候","confidence":0.72},
+            {"t":30.0,"text":"入殓的时候","confidence":0.84},
+            {"t":30.75,"text":"入殓的时候","confidence":0.89},
+            {"t":31.5,"text":"入殓的时候","confidence":0.87},
+            {"t":100.0,"text":"我丈夫是入殓师","confidence":0.91},
+            {"t":100.75,"text":"我文夫是入殓师","confidence":0.62}
+        ]"#;
+        let entries = entries_from_ocr_observations(raw, 0.75).unwrap();
+        let text = entries
+            .iter()
+            .map(|entry| entry.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(text.matches("入殓的时候").count(), 1);
+        assert!(!text.contains("入验"));
+        assert!(text.contains("我丈夫是入殓师"));
         assert!(!text.contains("文夫"));
     }
 

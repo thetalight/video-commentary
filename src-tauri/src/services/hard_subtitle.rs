@@ -1,7 +1,7 @@
 //! Local-only hard-subtitle OCR for macOS.
 //!
-//! The bundled Objective-C sidecar uses Apple's Vision framework over the lower half
-//! of sampled video frames, merges consecutive equal captions and writes SRT.
+//! The bundled Objective-C sidecar samples the lower subtitle band and records each
+//! frame's text, confidence and alternate readings. Rust then votes across frames.
 //! It never uploads frames and returns `Ok(None)` when the picture does not
 //! contain enough stable caption text to form a reliable transcript.
 use std::io::{BufRead, BufReader};
@@ -130,21 +130,34 @@ pub fn generate_srt_from_video(
             format!("本地画面字幕识别失败：{detail}")
         });
     }
-    let raw = match subtitle::parse_file(&output) {
-        Ok(entries) => entries,
-        Err(_) => {
-            let _ = std::fs::remove_file(&output);
-            return Ok(None);
+    let observations = output.with_extension("observations.json");
+    let entries = if observations.is_file() {
+        let raw = std::fs::read_to_string(&observations).map_err(|error| error.to_string())?;
+        match subtitle::entries_from_ocr_observations(&raw, 0.75) {
+            Ok(entries) => entries,
+            Err(error) => {
+                let _ = std::fs::remove_file(&observations);
+                return Err(error);
+            }
+        }
+    } else {
+        match subtitle::parse_file(&output) {
+            Ok(entries) => subtitle::clean_ocr_entries(&entries),
+            Err(_) => {
+                let _ = std::fs::remove_file(&output);
+                return Ok(None);
+            }
         }
     };
-    let entries = subtitle::clean_ocr_entries(&raw);
-    if entries.is_empty() {
+    if entries.is_empty() || subtitle::write_srt(&entries, &output).is_err() {
         let _ = std::fs::remove_file(&output);
+        let _ = std::fs::remove_file(&observations);
         return Ok(None);
     }
     let quality = subtitle::assess_quality(&entries);
     if quality.needs_retranscription {
         let _ = std::fs::remove_file(&output);
+        let _ = std::fs::remove_file(&observations);
         return Ok(None);
     }
     Ok(Some(output))

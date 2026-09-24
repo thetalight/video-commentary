@@ -638,7 +638,12 @@ async fn prepare_job_inner(
         &transcript_revision,
         "",
     )?;
-    task_store::finish_stage(&task_id, "transcribe", "running", "字幕已就绪")?;
+    task_store::finish_stage(
+        &task_id,
+        "transcribe",
+        "running",
+        &subtitle_correction::transcript_stage_message(&paths),
+    )?;
 
     let duration = ffmpeg::get_duration(&download.video_path).unwrap_or(0.0);
 

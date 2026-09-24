@@ -15,6 +15,8 @@ use crate::services::{director, llm, task_events};
 use crate::state::AppState;
 
 const CHUNK_SIZE: usize = 40;
+const CORRECTION_PROMPT_VERSION: &str = "ocr-correct-v2";
+const OCR_ALGORITHM_VERSION: &str = "frame-vote-v2";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CueFix {
@@ -31,10 +33,18 @@ struct ChunkFix {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CorrectionReport {
     input_fingerprint: String,
+    #[serde(default)]
+    correction_key: String,
     source: String,
     model: String,
+    #[serde(default)]
+    prompt_version: String,
+    #[serde(default)]
+    algorithm_version: String,
     cues_in: usize,
     cues_out: usize,
+    #[serde(default)]
+    chunk_count: usize,
     accepted_edits: u32,
     rejected_edits: u32,
     dropped: u32,
@@ -63,7 +73,8 @@ pub async fn assemble_transcript(
     }
 
     let fingerprint = transcript_fingerprint(&prepared);
-    if let Some(corrected) = load_current_correction(paths, &fingerprint)? {
+    let correction_key = correction_key(&fingerprint, &config.ollama_model, source);
+    if let Some(corrected) = load_current_correction(paths, &correction_key)? {
         return Ok(corrected);
     }
 
@@ -76,13 +87,18 @@ pub async fn assemble_transcript(
     );
     let _permit = app.state::<AppState>().acquire_director().await?;
     let options = director_options(config)?;
-    let corrected = correct_prepared(app, task_id, &options, &prepared, &fingerprint, paths).await?;
+    let corrected =
+        correct_prepared(app, task_id, &options, &prepared, &correction_key, paths).await?;
     let report = CorrectionReport {
         input_fingerprint: fingerprint,
+        correction_key,
         source: source.to_string(),
-        model: options.model,
+        model: options.model.clone(),
+        prompt_version: CORRECTION_PROMPT_VERSION.to_string(),
+        algorithm_version: OCR_ALGORITHM_VERSION.to_string(),
         cues_in: prepared.len(),
         cues_out: corrected.entries.len(),
+        chunk_count: corrected.chunk_count,
         accepted_edits: corrected.accepted_edits,
         rejected_edits: corrected.rejected_edits,
         dropped: corrected.dropped,
@@ -99,10 +115,7 @@ pub async fn assemble_transcript(
         Some(task_id),
         "transcribe",
         96.0,
-        &format!(
-            "字幕校对完成：采纳 {} 处，拒绝 {} 处越界修改，去掉 {} 条画面文字",
-            report.accepted_edits, report.rejected_edits, report.dropped
-        ),
+        &correction_progress_message(&report),
     );
     Ok(corrected.entries)
 }
@@ -112,6 +125,7 @@ struct AppliedCorrection {
     accepted_edits: u32,
     rejected_edits: u32,
     dropped: u32,
+    chunk_count: usize,
     failed_chunks: Vec<String>,
 }
 
@@ -120,13 +134,10 @@ async fn correct_prepared(
     task_id: &str,
     options: &director::DirectorOptions,
     prepared: &[SubtitleEntry],
-    fingerprint: &str,
+    correction_key: &str,
     paths: &JobPaths,
 ) -> Result<AppliedCorrection, String> {
-    let cache = paths
-        .root
-        .join("subtitle-correction")
-        .join(fingerprint);
+    let cache = paths.root.join("subtitle-correction").join(correction_key);
     std::fs::create_dir_all(&cache).map_err(|error| error.to_string())?;
     let chunks = prepared.chunks(CHUNK_SIZE).collect::<Vec<_>>();
     let mut entries = Vec::with_capacity(prepared.len());
@@ -193,6 +204,7 @@ async fn correct_prepared(
         accepted_edits,
         rejected_edits,
         dropped,
+        chunk_count: chunks.len(),
         failed_chunks,
     })
 }
@@ -321,6 +333,11 @@ fn is_connection_error(error: &str) -> bool {
 }
 
 fn load_entries(paths: &JobPaths, source: &str) -> Result<Vec<SubtitleEntry>, String> {
+    let observations = paths.root.join("source.ocr.observations.json");
+    if is_ocr_source(source) && observations.is_file() {
+        let raw = std::fs::read_to_string(&observations).map_err(|error| error.to_string())?;
+        return subtitle::entries_from_ocr_observations(&raw, 0.75);
+    }
     let raw_ocr = paths.root.join("source.ocr.srt");
     let path = if is_ocr_source(source) && raw_ocr.is_file() {
         raw_ocr
@@ -332,19 +349,63 @@ fn load_entries(paths: &JobPaths, source: &str) -> Result<Vec<SubtitleEntry>, St
 
 fn load_current_correction(
     paths: &JobPaths,
-    fingerprint: &str,
+    correction_key_value: &str,
 ) -> Result<Option<Vec<SubtitleEntry>>, String> {
     let report_path = paths.root.join("TRANSCRIPT.correction.json");
     let Ok(raw) = std::fs::read(&report_path) else {
         return Ok(None);
     };
     let report: CorrectionReport = serde_json::from_slice(&raw).map_err(|error| error.to_string())?;
-    if report.input_fingerprint != fingerprint || !paths.transcript.is_file() {
+    if report.correction_key != correction_key_value
+        || report.prompt_version != CORRECTION_PROMPT_VERSION
+        || report.algorithm_version != OCR_ALGORITHM_VERSION
+        || !paths.transcript.is_file()
+    {
         return Ok(None);
     }
     subtitle::parse_file(&paths.transcript)
         .map(Some)
         .map_err(|error| error.to_string())
+}
+
+fn correction_key(fingerprint: &str, model: &str, source: &str) -> String {
+    jobs::stable_hash(&[
+        fingerprint.as_bytes(),
+        model.trim().as_bytes(),
+        source.as_bytes(),
+        CORRECTION_PROMPT_VERSION.as_bytes(),
+        OCR_ALGORITHM_VERSION.as_bytes(),
+    ])
+}
+
+fn correction_progress_message(report: &CorrectionReport) -> String {
+    if report.failed_chunks.is_empty() {
+        format!(
+            "字幕校对完成：采纳 {} 处，拒绝 {} 处越界修改，去掉 {} 条画面文字",
+            report.accepted_edits, report.rejected_edits, report.dropped
+        )
+    } else {
+        format!(
+            "字幕校对完成，但 {}/{} 批校对失败，失败批次保留了原文",
+            report.failed_chunks.len(),
+            report.chunk_count.max(1)
+        )
+    }
+}
+
+pub fn transcript_stage_message(paths: &JobPaths) -> String {
+    let report_path = paths.root.join("TRANSCRIPT.correction.json");
+    let Ok(raw) = std::fs::read(report_path) else {
+        return "字幕已就绪".to_string();
+    };
+    let Ok(report) = serde_json::from_slice::<CorrectionReport>(&raw) else {
+        return "字幕已就绪".to_string();
+    };
+    if report.failed_chunks.is_empty() {
+        "字幕已校对".to_string()
+    } else {
+        correction_progress_message(&report)
+    }
 }
 
 fn persist_transcript(paths: &JobPaths, entries: &[SubtitleEntry]) -> Result<(), String> {
