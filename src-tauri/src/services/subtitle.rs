@@ -516,8 +516,9 @@ struct OcrObservationJson {
 
 struct ResolvedFrame {
     t: f64,
-    text: String,
-    confidence: f32,
+    /// Each inner list is one visual line. Every candidate from that line is kept
+    /// so later frames can outvote a weak first choice.
+    line_candidates: Vec<Vec<(String, f32)>>,
     x: f32,
     y: f32,
     w: f32,
@@ -537,130 +538,254 @@ pub fn entries_from_ocr_observations(
     Ok(vote_ocr_frames(&frames, interval))
 }
 
+struct OpenTrack {
+    segments: Vec<Vec<ResolvedFrame>>,
+    last_t: f64,
+    last_text: String,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+}
+
 fn vote_ocr_frames(frames: &[OcrObservationJson], interval: f64) -> Vec<SubtitleEntry> {
-    let resolved = frames
-        .iter()
-        .filter_map(resolve_frame)
-        .filter(|frame| frame.text.is_empty() || in_subtitle_band_box(frame.y, frame.h))
-        .collect::<Vec<_>>();
-    let mut clusters: Vec<Vec<&ResolvedFrame>> = Vec::new();
-    let mut broken = false;
-    for frame in &resolved {
-        if frame.text.is_empty() {
-            broken = true;
-            continue;
-        }
-        let can_extend = !broken
-            && clusters.last().is_some_and(|cluster| {
-                let active = cluster.last().expect("cluster is not empty");
-                let gap = frame.t - active.t;
-                gap <= interval.max(0.5) * 1.25
-                    && ocr_texts_match(&active.text, &frame.text)
-                    && same_resolved_band(active, frame)
-            });
-        broken = false;
-        if can_extend {
-            clusters.last_mut().expect("cluster exists").push(frame);
+    let mut atoms = Vec::new();
+    for frame in frames {
+        atoms.extend(atoms_from_observation(frame));
+    }
+    atoms.retain(|atom| in_subtitle_band_box(atom.y, atom.h) && !preview_text(atom).is_empty());
+    atoms.sort_by(|left, right| {
+        left.t
+            .partial_cmp(&right.t)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(
+                left.x
+                    .partial_cmp(&right.x)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            )
+    });
+
+    let sample = interval.max(0.5);
+    let mut tracks: Vec<OpenTrack> = Vec::new();
+    for atom in atoms {
+        let preview = preview_text(&atom);
+        let track_index = tracks
+            .iter()
+            .enumerate()
+            .filter_map(|(index, track)| {
+                let gap = atom.t - track.last_t;
+                if gap < -0.05 || gap > sample * 2.25 {
+                    return None;
+                }
+                let missed = if gap <= sample * 1.25 {
+                    0
+                } else {
+                    ((gap / sample).round() as u32).saturating_sub(1)
+                };
+                if missed >= 2 || !track_matches(track, &atom) {
+                    return None;
+                }
+                Some((index, (track.y - atom.y).abs()))
+            })
+            .min_by(|left, right| {
+                left.1
+                    .partial_cmp(&right.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|(index, _)| index);
+
+        if let Some(index) = track_index {
+            let track = &mut tracks[index];
+            if ocr_texts_match(&track.last_text, &preview) {
+                track.segments.last_mut().expect("track has a segment").push(atom);
+            } else {
+                track.segments.push(vec![atom]);
+            }
+            let current = track.segments.last().expect("segment exists");
+            let latest = current.last().expect("segment is not empty");
+            track.last_t = latest.t;
+            track.last_text = preview_text(latest);
+            track.x = latest.x;
+            track.y = latest.y;
+            track.w = latest.w;
+            track.h = latest.h;
         } else {
-            clusters.push(vec![frame]);
+            tracks.push(OpenTrack {
+                last_t: atom.t,
+                last_text: preview,
+                x: atom.x,
+                y: atom.y,
+                w: atom.w,
+                h: atom.h,
+                segments: vec![vec![atom]],
+            });
         }
     }
-    let entries = clusters
+
+    let entries = tracks
         .into_iter()
-        .filter_map(|cluster| vote_frame_cluster(&cluster, interval))
+        .filter(|track| !track_is_watermark(track))
+        .flat_map(|track| track.segments)
+        .filter_map(|segment| vote_frame_cluster(&segment, interval))
         .collect::<Vec<_>>();
     reindex_entries(trim_ocr_overlays(&entries))
 }
 
-fn resolve_frame(frame: &OcrObservationJson) -> Option<ResolvedFrame> {
+fn atoms_from_observation(frame: &OcrObservationJson) -> Vec<ResolvedFrame> {
     if !frame.lines.is_empty() {
-        let mut parts = Vec::new();
-        let mut confidence = 0.0;
-        let mut box_left = f32::MAX;
-        let mut box_right = 0.0_f32;
-        let mut box_bottom = f32::MAX;
-        let mut box_top = 0.0_f32;
-        for line in &frame.lines {
-            let Some(best) = line
-                .candidates
-                .iter()
-                .filter(|candidate| !candidate.text.trim().is_empty())
-                .max_by(|left, right| {
-                    left.confidence
-                        .partial_cmp(&right.confidence)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
-            else {
-                continue;
-            };
-            parts.push(best.text.trim().to_string());
-            confidence += best.confidence;
-            if line.w > 0.0 && line.h > 0.0 {
-                box_left = box_left.min(line.x);
-                box_right = box_right.max(line.x + line.w);
-                box_bottom = box_bottom.min(line.y);
-                box_top = box_top.max(line.y + line.h);
-            }
-        }
-        if parts.is_empty() {
-            return Some(blank_frame(frame.t));
-        }
-        return Some(ResolvedFrame {
-            t: frame.t,
-            text: parts.join(" "),
-            confidence: confidence / parts.len() as f32,
-            x: if box_left == f32::MAX { 0.0 } else { box_left },
-            y: if box_bottom == f32::MAX { 0.0 } else { box_bottom },
-            w: if box_left == f32::MAX {
-                0.0
-            } else {
-                box_right - box_left
-            },
-            h: if box_bottom == f32::MAX {
-                0.0
-            } else {
-                box_top - box_bottom
-            },
-        });
+        return group_stacked_lines(&frame.lines)
+            .into_iter()
+            .filter_map(|group| resolved_from_lines(frame.t, &group))
+            .collect();
     }
     if frame.text.trim().is_empty() {
-        return Some(blank_frame(frame.t));
+        return Vec::new();
     }
-    let mut best_text = frame.text.trim().to_string();
-    let mut best_confidence = frame.confidence;
+    let mut candidates = vec![(frame.text.trim().to_string(), frame.confidence)];
     for alternate in &frame.alts {
         let alternate_text = alternate.text.trim();
-        if alternate_text.is_empty() || alternate.confidence <= best_confidence {
+        if alternate_text.is_empty() {
             continue;
         }
         let primary_len = normalize_ocr_text(&frame.text).chars().count();
         let alternate_len = normalize_ocr_text(alternate_text).chars().count();
         if primary_len.abs_diff(alternate_len) <= 2 {
-            best_text = alternate_text.to_string();
-            best_confidence = alternate.confidence;
+            candidates.push((alternate_text.to_string(), alternate.confidence));
         }
     }
-    Some(ResolvedFrame {
+    vec![ResolvedFrame {
         t: frame.t,
-        text: best_text,
-        confidence: best_confidence,
+        line_candidates: vec![candidates],
         x: frame.x,
         y: frame.y,
         w: frame.w,
         h: frame.h,
+    }]
+}
+
+fn group_stacked_lines(lines: &[OcrLineJson]) -> Vec<Vec<&OcrLineJson>> {
+    let mut ordered = lines.iter().collect::<Vec<_>>();
+    ordered.sort_by(|left, right| {
+        left.y
+            .partial_cmp(&right.y)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut groups: Vec<Vec<&OcrLineJson>> = Vec::new();
+    for line in ordered {
+        if let Some(group) = groups
+            .iter_mut()
+            .find(|group| group.iter().any(|existing| lines_are_stacked(existing, line)))
+        {
+            group.push(line);
+        } else {
+            groups.push(vec![line]);
+        }
+    }
+    groups
+}
+
+fn lines_are_stacked(left: &OcrLineJson, right: &OcrLineJson) -> bool {
+    if left.w <= 0.0 || right.w <= 0.0 || left.h <= 0.0 || right.h <= 0.0 {
+        return true;
+    }
+    let y_delta = (left.y + left.h / 2.0) - (right.y + right.h / 2.0);
+    let x_delta = (left.x + left.w / 2.0) - (right.x + right.w / 2.0);
+    y_delta.abs() <= 0.08 && x_delta.abs() <= 0.22
+}
+
+fn resolved_from_lines(time: f64, lines: &[&OcrLineJson]) -> Option<ResolvedFrame> {
+    let mut line_candidates = Vec::new();
+    let mut box_left = f32::MAX;
+    let mut box_right = 0.0_f32;
+    let mut box_bottom = f32::MAX;
+    let mut box_top = 0.0_f32;
+    for line in lines {
+        let candidates = line
+            .candidates
+            .iter()
+            .filter(|candidate| !candidate.text.trim().is_empty())
+            .map(|candidate| (candidate.text.trim().to_string(), candidate.confidence))
+            .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            continue;
+        }
+        line_candidates.push(candidates);
+        if line.w > 0.0 && line.h > 0.0 {
+            box_left = box_left.min(line.x);
+            box_right = box_right.max(line.x + line.w);
+            box_bottom = box_bottom.min(line.y);
+            box_top = box_top.max(line.y + line.h);
+        }
+    }
+    if line_candidates.is_empty() {
+        return None;
+    }
+    Some(ResolvedFrame {
+        t: time,
+        line_candidates,
+        x: if box_left == f32::MAX { 0.0 } else { box_left },
+        y: if box_bottom == f32::MAX {
+            0.0
+        } else {
+            box_bottom
+        },
+        w: if box_left == f32::MAX {
+            0.0
+        } else {
+            box_right - box_left
+        },
+        h: if box_bottom == f32::MAX {
+            0.0
+        } else {
+            box_top - box_bottom
+        },
     })
 }
 
-fn blank_frame(time: f64) -> ResolvedFrame {
-    ResolvedFrame {
-        t: time,
-        text: String::new(),
-        confidence: 0.0,
-        x: 0.0,
-        y: 0.0,
-        w: 0.0,
-        h: 0.0,
+fn preview_text(frame: &ResolvedFrame) -> String {
+    frame
+        .line_candidates
+        .iter()
+        .filter_map(|candidates| {
+            candidates.iter().max_by(|left, right| {
+                left.1
+                    .partial_cmp(&right.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+        })
+        .map(|(text, _)| text.as_str())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn track_matches(track: &OpenTrack, atom: &ResolvedFrame) -> bool {
+    same_resolved_band(
+        &ResolvedFrame {
+            t: track.last_t,
+            line_candidates: Vec::new(),
+            x: track.x,
+            y: track.y,
+            w: track.w,
+            h: track.h,
+        },
+        atom,
+    )
+}
+
+fn track_is_watermark(track: &OpenTrack) -> bool {
+    let mut texts = std::collections::HashSet::new();
+    let mut count = 0_usize;
+    let mut first = f64::MAX;
+    let mut last = 0.0_f64;
+    for segment in &track.segments {
+        for frame in segment {
+            texts.insert(normalize_ocr_text(&preview_text(frame)));
+            count += 1;
+            first = first.min(frame.t);
+            last = last.max(frame.t);
+        }
     }
+    texts.len() == 1 && count >= 8 && last - first >= 20.0
 }
 
 fn in_subtitle_band_box(y: f32, h: f32) -> bool {
@@ -680,54 +805,46 @@ fn same_resolved_band(left: &ResolvedFrame, right: &ResolvedFrame) -> bool {
     y_delta <= 0.06 && height_ratio <= 1.8 && overlap > 0.0
 }
 
-fn vote_frame_cluster(cluster: &[&ResolvedFrame], interval: f64) -> Option<SubtitleEntry> {
-    let mut scores: HashMap<String, (u32, f32, f64, String)> = HashMap::new();
-    for frame in cluster {
-        add_reading(&mut scores, &frame.text, frame.confidence, frame.t, true);
+fn vote_frame_cluster(cluster: &[ResolvedFrame], interval: f64) -> Option<SubtitleEntry> {
+    let line_count = cluster
+        .iter()
+        .map(|frame| frame.line_candidates.len())
+        .max()
+        .unwrap_or(0);
+    let mut parts = Vec::new();
+    for index in 0..line_count {
+        let mut scores: HashMap<String, (f32, String)> = HashMap::new();
+        for frame in cluster {
+            let Some(candidates) = frame.line_candidates.get(index) else {
+                continue;
+            };
+            for (text, confidence) in candidates {
+                let key = normalize_ocr_text(text);
+                if key.is_empty() {
+                    continue;
+                }
+                let record = scores.entry(key).or_insert((0.0, text.clone()));
+                record.0 += confidence;
+            }
+        }
+        let winner = scores.into_values().max_by(|left, right| {
+            left.0
+                .partial_cmp(&right.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })?;
+        parts.push(winner.1);
     }
-    let winner = scores.into_values().max_by(|left, right| {
-        left.0.cmp(&right.0).then(
-            left.1
-                .partial_cmp(&right.1)
-                .unwrap_or(std::cmp::Ordering::Equal),
-        ).then(
-            left.2
-                .partial_cmp(&right.2)
-                .unwrap_or(std::cmp::Ordering::Equal),
-        )
-    })?;
+    if parts.is_empty() {
+        return None;
+    }
     let start = cluster.first()?.t;
     let end = cluster.last()?.t + interval.max(0.4);
     Some(SubtitleEntry {
         index: 1,
         start: secs_to_time(start),
         end: secs_to_time(end),
-        text: winner.3,
+        text: parts.join(" "),
     })
-}
-
-fn add_reading(
-    scores: &mut HashMap<String, (u32, f32, f64, String)>,
-    text: &str,
-    confidence: f32,
-    time: f64,
-    primary: bool,
-) {
-    let key = normalize_ocr_text(text);
-    if key.is_empty() {
-        return;
-    }
-    let record = scores
-        .entry(key)
-        .or_insert((0, 0.0, time, text.trim().to_string()));
-    if primary {
-        record.0 += 1;
-    }
-    record.1 += confidence;
-    if time >= record.2 {
-        record.2 = time;
-        record.3 = text.trim().to_string();
-    }
 }
 
 fn reindex_entries(entries: Vec<SubtitleEntry>) -> Vec<SubtitleEntry> {
@@ -930,6 +1047,64 @@ mod tests {
         let entries = entries_from_ocr_observations(raw, 0.75).unwrap();
         assert_eq!(entries.len(), 2);
         assert!(entries.iter().all(|entry| entry.text == "我知道了"));
+    }
+
+    #[test]
+    fn second_choice_can_win_across_frames() {
+        let raw = r#"[
+            {"t":1.0,"lines":[{"x":0.3,"y":0.05,"w":0.3,"h":0.05,"candidates":[
+                {"text":"入验的时候","confidence":0.62},
+                {"text":"入殓的时候","confidence":0.60}
+            ]}]},
+            {"t":1.75,"lines":[{"x":0.3,"y":0.05,"w":0.3,"h":0.05,"candidates":[
+                {"text":"入验的时候","confidence":0.63},
+                {"text":"入殓的时候","confidence":0.61}
+            ]}]},
+            {"t":2.5,"lines":[{"x":0.3,"y":0.05,"w":0.3,"h":0.05,"candidates":[
+                {"text":"入验的时候","confidence":0.40},
+                {"text":"入殓的时候","confidence":0.95}
+            ]}]}
+        ]"#;
+        let entries = entries_from_ocr_observations(raw, 0.75).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].text, "入殓的时候");
+    }
+
+    #[test]
+    fn watermark_stays_off_the_dialogue_line() {
+        let raw = r#"[
+            {"t":1.0,"lines":[
+                {"x":0.02,"y":0.02,"w":0.12,"h":0.04,"candidates":[{"text":"爱壹帆","confidence":0.95}]},
+                {"x":0.28,"y":0.05,"w":0.46,"h":0.05,"candidates":[{"text":"我今天一定会回来","confidence":0.9}]}
+            ]},
+            {"t":1.75,"lines":[
+                {"x":0.02,"y":0.02,"w":0.12,"h":0.04,"candidates":[{"text":"爱壹帆","confidence":0.95}]},
+                {"x":0.28,"y":0.05,"w":0.46,"h":0.05,"candidates":[{"text":"走吧","confidence":0.9}]}
+            ]}
+        ]"#;
+        let text = entries_from_ocr_observations(raw, 0.75)
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("我今天一定会回来"));
+        assert!(text.contains("走吧"));
+        assert!(!text.contains("爱壹帆 我今天"));
+        assert!(!text.contains("爱壹帆 走吧"));
+    }
+
+    #[test]
+    fn one_missed_frame_does_not_split_caption() {
+        let raw = r#"[
+            {"t":10.5,"text":"我知道了","confidence":0.9,"x":0.3,"y":0.05,"w":0.3,"h":0.05},
+            {"t":11.25,"text":"","confidence":0},
+            {"t":12.0,"text":"我知道了","confidence":0.88,"x":0.3,"y":0.05,"w":0.3,"h":0.05}
+        ]"#;
+        let entries = entries_from_ocr_observations(raw, 0.75).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].text, "我知道了");
+        assert!(entries[0].end.starts_with("00:00:12"));
     }
 
     #[test]

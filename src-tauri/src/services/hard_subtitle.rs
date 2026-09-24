@@ -61,9 +61,9 @@ pub fn generate_srt_from_video(
     };
     std::fs::create_dir_all(output_dir).map_err(|error| error.to_string())?;
     let output = output_dir.join("source.ocr.srt");
-    if output.exists() {
-        let _ = std::fs::remove_file(&output);
-    }
+    let stale_observations = subtitle::ocr_observations_path(&output);
+    let _ = std::fs::remove_file(&output);
+    let _ = std::fs::remove_file(&stale_observations);
     task_events::emit_progress(
         app,
         Some(task_id),
