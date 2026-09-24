@@ -16,7 +16,7 @@ use crate::state::AppState;
 
 const CHUNK_SIZE: usize = 40;
 const CORRECTION_PROMPT_VERSION: &str = "ocr-correct-v2";
-const OCR_ALGORITHM_VERSION: &str = "frame-vote-v3";
+const OCR_ALGORITHM_VERSION: &str = "frame-vote-v4";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CueFix {

@@ -32,45 +32,18 @@ static NSString *VCNormalized(NSString *value) {
     return result;
 }
 
-static NSUInteger VCEditDistance(NSString *left, NSString *right) {
-    NSUInteger rows = left.length + 1;
-    NSUInteger columns = right.length + 1;
-    NSUInteger *previous = calloc(columns, sizeof(NSUInteger));
-    NSUInteger *current = calloc(columns, sizeof(NSUInteger));
-    for (NSUInteger column = 0; column < columns; column++) previous[column] = column;
-    for (NSUInteger row = 1; row < rows; row++) {
-        current[0] = row;
-        unichar a = [left characterAtIndex:row - 1];
-        for (NSUInteger column = 1; column < columns; column++) {
-            unichar b = [right characterAtIndex:column - 1];
-            NSUInteger insertion = current[column - 1] + 1;
-            NSUInteger deletion = previous[column] + 1;
-            NSUInteger replace = previous[column - 1] + (a == b ? 0 : 1);
-            current[column] = MIN(insertion, MIN(deletion, replace));
-        }
-        NSUInteger *swap = previous;
-        previous = current;
-        current = swap;
-    }
-    NSUInteger result = previous[columns - 1];
-    free(previous);
-    free(current);
-    return result;
+static BOOL VCIsEastAsian(unichar character) {
+    return (character >= 0x3040 && character <= 0x30ff) ||
+           (character >= 0x3400 && character <= 0x9fff) ||
+           (character >= 0xac00 && character <= 0xd7af);
 }
 
-static BOOL VCNearReading(NSString *left, NSString *right) {
-    NSString *a = VCNormalized(left);
-    NSString *b = VCNormalized(right);
-    if (a.length == 0 || b.length == 0) return NO;
-    if ([a isEqualToString:b]) return YES;
-    NSUInteger longest = MAX(a.length, b.length);
-    if (longest <= 2) return NO;
-    NSUInteger distance = VCEditDistance(a, b);
-    if (longest <= 12) return distance <= 1;
-    return (double)distance / (double)longest <= 0.34;
+static BOOL VCHasText(NSString *value) {
+    NSString *normalized = VCNormalized(value);
+    if (normalized.length == 0) return NO;
+    if (normalized.length >= 2) return YES;
+    return VCIsEastAsian([normalized characterAtIndex:0]);
 }
-
-static BOOL VCHasText(NSString *value) { return VCNormalized(value).length >= 2; }
 
 static CGImageRef VCCopyFrame(AVAssetImageGenerator *generator, double second) {
     CMTime actual = kCMTimeZero;
@@ -93,41 +66,28 @@ static NSDictionary *VCRecognize(CGImageRef image, VNRecognizeTextRequest *reque
                    ? NSOrderedAscending
                    : NSOrderedDescending;
     }];
-    NSMutableArray<NSString *> *lines = [NSMutableArray array];
-    NSMutableArray<NSDictionary *> *alts = [NSMutableArray array];
-    float confidence = 0;
-    CGRect unionBox = CGRectNull;
+    NSMutableArray<NSDictionary *> *lines = [NSMutableArray array];
     for (VNRecognizedTextObservation *observation in observations) {
         CGRect box = observation.boundingBox;
         if (CGRectGetMidY(box) > 0.22 || CGRectGetHeight(box) > 0.14) continue;
-        NSArray<VNRecognizedText *> *candidates = [observation topCandidates:3];
-        VNRecognizedText *primary = candidates.firstObject;
-        if (!primary || primary.confidence < 0.35 || !VCHasText(primary.string)) continue;
-        [lines addObject:primary.string];
-        confidence += primary.confidence;
-        unionBox = CGRectIsNull(unionBox) ? box : CGRectUnion(unionBox, box);
-        for (NSUInteger index = 1; index < candidates.count; index++) {
-            VNRecognizedText *alternate = candidates[index];
-            if (alternate.confidence < 0.35 || !VCHasText(alternate.string)) continue;
-            if (!VCNearReading(primary.string, alternate.string)) continue;
-            [alts addObject:@{
-                @"text" : alternate.string,
-                @"confidence" : @(alternate.confidence)
+        NSMutableArray<NSDictionary *> *candidates = [NSMutableArray array];
+        for (VNRecognizedText *candidate in [observation topCandidates:3]) {
+            if (candidate.confidence < 0.35 || !VCHasText(candidate.string)) continue;
+            [candidates addObject:@{
+                @"text" : candidate.string,
+                @"confidence" : @(candidate.confidence)
             }];
         }
+        if (candidates.count == 0) continue;
+        [lines addObject:@{
+            @"x" : @(CGRectGetMinX(box)),
+            @"y" : @(CGRectGetMinY(box)),
+            @"w" : @(CGRectGetWidth(box)),
+            @"h" : @(CGRectGetHeight(box)),
+            @"candidates" : candidates
+        }];
     }
-    if (lines.count == 0) return @{ @"text" : @"", @"confidence" : @0 };
-    NSString *text = [[lines componentsJoinedByString:@" "]
-        stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
-    return @{
-        @"text" : text,
-        @"confidence" : @(confidence / lines.count),
-        @"x" : @(CGRectGetMinX(unionBox)),
-        @"y" : @(CGRectGetMinY(unionBox)),
-        @"w" : @(CGRectGetWidth(unionBox)),
-        @"h" : @(CGRectGetHeight(unionBox)),
-        @"alts" : alts
-    };
+    return @{ @"text" : @"", @"confidence" : @0, @"lines" : lines };
 }
 
 static BOOL VCProbe(double duration, AVAssetImageGenerator *generator, VNRecognizeTextRequest *request) {
@@ -141,10 +101,14 @@ static BOOL VCProbe(double duration, AVAssetImageGenerator *generator, VNRecogni
             if (!frame) continue;
             NSDictionary *recognized = VCRecognize(frame, request);
             CGImageRelease(frame);
-            NSString *key = VCNormalized(recognized[@"text"]);
-            if (key.length >= 2 && [recognized[@"confidence"] floatValue] >= 0.42) {
-                hits++;
-                [unique addObject:key];
+            for (NSDictionary *line in recognized[@"lines"]) {
+                NSDictionary *best = [line[@"candidates"] firstObject];
+                NSString *key = VCNormalized(best[@"text"]);
+                if (key.length >= 1 && [best[@"confidence"] floatValue] >= 0.42) {
+                    hits++;
+                    [unique addObject:key];
+                    break;
+                }
             }
         }
     }
@@ -197,26 +161,26 @@ int main(int argc, const char *argv[]) {
                 CGImageRef frame = VCCopyFrame(generator, second);
                 NSDictionary *recognized = frame ? VCRecognize(frame, request) : @{ @"text" : @"", @"confidence" : @0 };
                 if (frame) CGImageRelease(frame);
-                NSString *text = recognized[@"text"];
-                float confidence = [recognized[@"confidence"] floatValue];
-                if (VCHasText(text) && confidence >= 0.38) {
-                    NSMutableDictionary *sample = [recognized mutableCopy];
-                    sample[@"t"] = @(second);
-                    [samples addObject:sample];
-                }
+                NSMutableDictionary *sample = [recognized mutableCopy];
+                sample[@"t"] = @(second);
+                [samples addObject:sample];
                 if (index % 20 == 0) {
                     VCProgress(5 + 92.0 * index / MAX(total, 1),
                                [NSString stringWithFormat:@"正在本地识别画面字幕 %ld/%ld", (long)index, (long)total]);
                 }
             }
         }
+        NSInteger textFrames = 0;
         NSInteger minimum = duration >= 1200 ? 30 : MAX(5, (NSInteger)(duration / 240));
         NSMutableIndexSet *quarters = [NSMutableIndexSet indexSet];
         for (NSDictionary *sample in samples) {
+            NSArray *lines = sample[@"lines"];
+            if (![lines isKindOfClass:NSArray.class] || lines.count == 0) continue;
+            textFrames++;
             double start = [sample[@"t"] doubleValue];
             [quarters addIndex:MIN(3, (NSUInteger)((start / duration) * 4))];
         }
-        if (samples.count < minimum || (duration >= 1200 && quarters.count < 3)) {
+        if (textFrames < minimum || (duration >= 1200 && quarters.count < 3)) {
             VCProgress(100, @"画面文字不足以构成连续字幕，已放弃 OCR 结果");
             return 3;
         }
