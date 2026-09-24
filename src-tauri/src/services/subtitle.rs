@@ -260,9 +260,11 @@ pub fn assess_quality(entries: &[SubtitleEntry]) -> SubtitleQuality {
         penalty = penalty.saturating_add(25);
     }
 
+    let score = 100u8.saturating_sub(penalty);
+    let severe_garble = unexpected_ratio > 0.006;
     SubtitleQuality {
-        needs_retranscription: !reasons.is_empty(),
-        score: 100u8.saturating_sub(penalty),
+        needs_retranscription: leaked_prompt || severe_garble || score < 60,
+        score,
         reasons,
     }
 }
@@ -318,8 +320,11 @@ pub(crate) fn ocr_edit_is_conservative(original: &str, corrected: &str) -> bool 
         return false;
     }
     let distance = ocr_edit_distance(&left, &right);
-    let longest = left.chars().count().max(right.chars().count()).max(1);
-    distance <= 8 && distance * 5 <= longest * 2
+    let longest = left.chars().count().max(right.chars().count());
+    if longest <= 12 {
+        return distance <= 2;
+    }
+    distance * 4 <= longest
 }
 
 pub(crate) fn is_disposable_overlay(text: &str) -> bool {
@@ -467,7 +472,19 @@ struct OcrObservationJson {
     text: String,
     confidence: f32,
     #[serde(default)]
+    x: f32,
+    #[serde(default)]
+    y: f32,
+    #[serde(default)]
+    w: f32,
+    #[serde(default)]
+    h: f32,
+    #[serde(default)]
     alts: Vec<OcrAltJson>,
+}
+
+pub fn ocr_observations_path(srt: &std::path::Path) -> std::path::PathBuf {
+    srt.with_extension("observations.json")
 }
 
 pub fn entries_from_ocr_observations(
@@ -482,13 +499,15 @@ pub fn entries_from_ocr_observations(
 fn vote_ocr_frames(frames: &[OcrObservationJson], interval: f64) -> Vec<SubtitleEntry> {
     let mut clusters: Vec<Vec<&OcrObservationJson>> = Vec::new();
     for frame in frames {
-        if frame.text.trim().is_empty() || frame.confidence < 0.38 {
+        if frame.text.trim().is_empty() || frame.confidence < 0.38 || !in_subtitle_band(frame) {
             continue;
         }
         let can_extend = clusters.last().is_some_and(|cluster| {
             let active = cluster.last().expect("cluster is not empty");
             let gap = frame.t - active.t;
-            (0.0..=2.6).contains(&gap) && ocr_texts_match(&active.text, &frame.text)
+            (0.0..=2.6).contains(&gap)
+                && ocr_texts_match(&active.text, &frame.text)
+                && same_caption_band(active, frame)
         });
         if can_extend {
             clusters.last_mut().expect("cluster exists").push(frame);
@@ -501,6 +520,25 @@ fn vote_ocr_frames(frames: &[OcrObservationJson], interval: f64) -> Vec<Subtitle
         .filter_map(|cluster| vote_frame_cluster(&cluster, interval))
         .collect::<Vec<_>>();
     reindex_entries(trim_ocr_overlays(&entries))
+}
+
+fn in_subtitle_band(frame: &OcrObservationJson) -> bool {
+    if frame.h <= 0.0 {
+        return true;
+    }
+    frame.y + frame.h / 2.0 <= 0.28
+}
+
+fn same_caption_band(left: &OcrObservationJson, right: &OcrObservationJson) -> bool {
+    if left.w <= 0.0 || right.w <= 0.0 || left.h <= 0.0 || right.h <= 0.0 {
+        return true;
+    }
+    let y_delta = (left.y - right.y).abs();
+    let height_ratio = left.h.max(right.h) / left.h.min(right.h).max(0.001);
+    let left_right = left.x + left.w;
+    let right_right = right.x + right.w;
+    let overlap = left_right.min(right_right) - left.x.max(right.x);
+    y_delta <= 0.06 && height_ratio <= 1.8 && overlap > 0.0
 }
 
 fn vote_frame_cluster(cluster: &[&OcrObservationJson], interval: f64) -> Option<SubtitleEntry> {
@@ -720,7 +758,11 @@ mod tests {
                 .count(),
             1
         );
-        assert_eq!(text.matches("我文夫是入殓师").count(), 1);
+        assert_eq!(
+            text.lines().filter(|line| line.contains("入殓师")).count(),
+            1,
+            "the two husband readings must collapse to one cue; confidence, not order, decides the character"
+        );
     }
 
     #[test]
@@ -730,8 +772,9 @@ mod tests {
             {"t":30.0,"text":"入殓的时候","confidence":0.84},
             {"t":30.75,"text":"入殓的时候","confidence":0.89},
             {"t":31.5,"text":"入殓的时候","confidence":0.87},
-            {"t":100.0,"text":"我丈夫是入殓师","confidence":0.91},
-            {"t":100.75,"text":"我文夫是入殓师","confidence":0.62}
+            {"t":100.0,"text":"我丈夫是入殓师","confidence":0.91,"x":0.31,"y":0.05,"w":0.38,"h":0.06},
+            {"t":100.75,"text":"我文夫是入殓师","confidence":0.62,"x":0.31,"y":0.05,"w":0.38,"h":0.06},
+            {"t":101.5,"text":"我文夫是入殓师","confidence":0.9,"x":0.2,"y":0.72,"w":0.4,"h":0.05}
         ]"#;
         let entries = entries_from_ocr_observations(raw, 0.75).unwrap();
         let text = entries

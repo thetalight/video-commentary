@@ -16,7 +16,7 @@ use crate::state::AppState;
 
 const CHUNK_SIZE: usize = 40;
 const CORRECTION_PROMPT_VERSION: &str = "ocr-correct-v2";
-const OCR_ALGORITHM_VERSION: &str = "frame-vote-v2";
+const OCR_ALGORITHM_VERSION: &str = "frame-vote-v3";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CueFix {
@@ -333,7 +333,7 @@ fn is_connection_error(error: &str) -> bool {
 }
 
 fn load_entries(paths: &JobPaths, source: &str) -> Result<Vec<SubtitleEntry>, String> {
-    let observations = paths.root.join("source.ocr.observations.json");
+    let observations = subtitle::ocr_observations_path(&paths.root.join("source.ocr.srt"));
     if is_ocr_source(source) && observations.is_file() {
         let raw = std::fs::read_to_string(&observations).map_err(|error| error.to_string())?;
         return subtitle::entries_from_ocr_observations(&raw, 0.75);

@@ -130,7 +130,7 @@ pub fn generate_srt_from_video(
             format!("本地画面字幕识别失败：{detail}")
         });
     }
-    let observations = output.with_extension("observations.json");
+    let observations = subtitle::ocr_observations_path(&output);
     let entries = if observations.is_file() {
         let raw = std::fs::read_to_string(&observations).map_err(|error| error.to_string())?;
         match subtitle::entries_from_ocr_observations(&raw, 0.75) {

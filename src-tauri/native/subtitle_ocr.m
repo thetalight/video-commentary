@@ -3,15 +3,6 @@
 #import <Foundation/Foundation.h>
 #import <Vision/Vision.h>
 
-@interface VCCaption : NSObject
-@property(nonatomic) double start;
-@property(nonatomic) double end;
-@property(nonatomic, copy) NSString *text;
-@property(nonatomic) float confidence;
-@end
-@implementation VCCaption
-@end
-
 static void VCProgress(double progress, NSString *message) {
     NSDictionary *payload = @{
         @"progress" : @(MAX(0, MIN(100, progress))),
@@ -160,56 +151,11 @@ static BOOL VCProbe(double duration, AVAssetImageGenerator *generator, VNRecogni
     return hits >= 4 && unique.count >= 3;
 }
 
-static NSArray<VCCaption *> *VCRemoveStaticOverlays(NSArray<VCCaption *> *captions) {
-    NSMutableDictionary<NSString *, NSMutableArray<NSNumber *> *> *occurrences = [NSMutableDictionary dictionary];
-    [captions enumerateObjectsUsingBlock:^(VCCaption *caption, NSUInteger index, BOOL *stop) {
-        NSString *key = VCNormalized(caption.text);
-        if (key.length >= 4) {
-            if (!occurrences[key]) occurrences[key] = [NSMutableArray array];
-            [occurrences[key] addObject:@(index)];
-        }
-    }];
-    NSMutableIndexSet *rejected = [NSMutableIndexSet indexSet];
-    for (NSArray<NSNumber *> *indices in occurrences.allValues) {
-        if (indices.count < 8) continue;
-        VCCaption *first = captions[indices.firstObject.unsignedIntegerValue];
-        VCCaption *last = captions[indices.lastObject.unsignedIntegerValue];
-        if (last.start - first.start < 60) continue;
-        for (NSNumber *index in indices) [rejected addIndex:index.unsignedIntegerValue];
-    }
-    NSMutableArray<VCCaption *> *result = [NSMutableArray array];
-    [captions enumerateObjectsUsingBlock:^(VCCaption *caption, NSUInteger index, BOOL *stop) {
-        if (![rejected containsIndex:index]) [result addObject:caption];
-    }];
-    return result;
-}
-
-static NSString *VCTime(double seconds) {
-    NSInteger total = (NSInteger)llround(MAX(0, seconds) * 1000);
-    NSInteger milliseconds = total % 1000;
-    NSInteger allSeconds = total / 1000;
-    NSInteger second = allSeconds % 60;
-    NSInteger allMinutes = allSeconds / 60;
-    return [NSString stringWithFormat:@"%02ld:%02ld:%02ld,%03ld",
-                                      (long)(allMinutes / 60), (long)(allMinutes % 60),
-                                      (long)second, (long)milliseconds];
-}
-
-static BOOL VCWriteSRT(NSArray<VCCaption *> *captions, NSString *path) {
-    NSMutableString *result = [NSMutableString string];
-    [captions enumerateObjectsUsingBlock:^(VCCaption *caption, NSUInteger index, BOOL *stop) {
-        [result appendFormat:@"%lu\n%@ --> %@\n%@\n\n", (unsigned long)index + 1,
-                             VCTime(caption.start), VCTime(caption.end), caption.text];
-    }];
-    [[NSFileManager defaultManager] createDirectoryAtPath:path.stringByDeletingLastPathComponent
-                              withIntermediateDirectories:YES attributes:nil error:nil];
-    return [result writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
-}
-
 int main(int argc, const char *argv[]) {
     @autoreleasepool {
         if (argc < 3) {
             fprintf(stderr, "usage: subtitle-ocr <video> <output.srt> [interval]\n");
+            fprintf(stderr, "writes <output>.observations.json with one raw sample per frame\n");
             return 2;
         }
         NSString *videoPath = [NSString stringWithUTF8String:argv[1]];
