@@ -232,17 +232,20 @@ pub fn assess_quality(entries: &[SubtitleEntry]) -> SubtitleQuality {
         reasons.push("过多字幕行缺少有效对白信息".to_string());
         penalty = penalty.saturating_add(30);
     }
-    let adjacent = entries.windows(2).filter(|pair| {
-        let gap = time_to_secs(&pair[1].start) - time_to_secs(&pair[0].end);
-        let brief = |entry: &SubtitleEntry| {
-            time_to_secs(&entry.end) - time_to_secs(&entry.start) <= 0.8
-        };
-        (-0.2..=2.6).contains(&gap)
-            && brief(&pair[0])
-            && brief(&pair[1])
-            && ocr_texts_match(&pair[0].text, &pair[1].text)
-            && normalize_ocr_text(&pair[0].text) != normalize_ocr_text(&pair[1].text)
-    }).count();
+    let adjacent = entries
+        .windows(2)
+        .filter(|pair| {
+            let gap = time_to_secs(&pair[1].start) - time_to_secs(&pair[0].end);
+            let brief = |entry: &SubtitleEntry| {
+                time_to_secs(&entry.end) - time_to_secs(&entry.start) <= 0.8
+            };
+            (-0.2..=2.6).contains(&gap)
+                && brief(&pair[0])
+                && brief(&pair[1])
+                && ocr_texts_match(&pair[0].text, &pair[1].text)
+                && normalize_ocr_text(&pair[0].text) != normalize_ocr_text(&pair[1].text)
+        })
+        .count();
     if entries.len() > 1 && adjacent as f64 / (entries.len() - 1) as f64 > 0.12 {
         reasons.push("相邻字幕仍是同一句的不同识别结果".to_string());
         penalty = penalty.saturating_add(30);
@@ -293,7 +296,7 @@ pub fn clean_ocr_entries(entries: &[SubtitleEntry]) -> Vec<SubtitleEntry> {
     let collapsed = entries
         .iter()
         .filter_map(|entry| {
-            let text = collapse_repeated_phrase(entry.text.trim());
+            let text = strip_mixed_visual_overlay(&collapse_repeated_phrase(entry.text.trim()));
             (!text.is_empty()).then(|| SubtitleEntry {
                 index: entry.index,
                 start: entry.start.clone(),
@@ -302,8 +305,60 @@ pub fn clean_ocr_entries(entries: &[SubtitleEntry]) -> Vec<SubtitleEntry> {
             })
         })
         .collect::<Vec<_>>();
-    let merged = merge_similar_ocr_cues(&collapsed);
+    // Detect a dense credit tail before fuzzy merging: consecutive cast names
+    // often differ by only one character and would otherwise collapse into a
+    // single cue, hiding the roll from the tail classifier.
+    let pretrimmed = trim_ocr_overlays(&collapsed);
+    let merged = merge_similar_ocr_cues(&pretrimmed);
     reindex_entries(trim_ocr_overlays(&merged))
+}
+
+/// OCR occasionally joins a large all-caps shop/logo line to the actual Chinese
+/// subtitle.  Keep the dialogue half instead of either feeding the logo to the
+/// director or dropping the whole cue.  This is deliberately conservative: the
+/// removable side must contain at least five Latin letters and be mostly upper
+/// case, while the retained side must contain at least four East-Asian glyphs.
+fn strip_mixed_visual_overlay(text: &str) -> String {
+    let chars = text.char_indices().collect::<Vec<_>>();
+    let first_east_asian = chars
+        .iter()
+        .find_map(|(offset, character)| is_east_asian(*character).then_some(*offset));
+    let last_east_asian_end = chars.iter().rev().find_map(|(offset, character)| {
+        is_east_asian(*character).then_some(*offset + character.len_utf8())
+    });
+
+    let looks_like_visual_label = |value: &str| {
+        let latin = value
+            .chars()
+            .filter(|character| character.is_ascii_alphabetic())
+            .count();
+        let uppercase = value
+            .chars()
+            .filter(|character| character.is_ascii_uppercase())
+            .count();
+        latin >= 5 && uppercase * 4 >= latin * 3
+    };
+    let east_asian_count = text
+        .chars()
+        .filter(|character| is_east_asian(*character))
+        .count();
+    if east_asian_count < 4 {
+        return text.trim().to_string();
+    }
+
+    let mut start = 0;
+    let mut end = text.len();
+    if let Some(first) = first_east_asian {
+        if looks_like_visual_label(&text[..first]) {
+            start = first;
+        }
+    }
+    if let Some(last) = last_east_asian_end {
+        if last >= start && looks_like_visual_label(&text[last..]) {
+            end = last;
+        }
+    }
+    text[start..end].trim().to_string()
 }
 
 fn collapse_repeated_phrase(text: &str) -> String {
@@ -412,11 +467,9 @@ fn vote_text_cluster(cluster: Vec<SubtitleEntry>) -> Option<SubtitleEntry> {
         record.1 = offset;
         record.2 = entry.text.clone();
     }
-    let winner = counts.into_values().max_by(|left, right| {
-        left.0
-            .cmp(&right.0)
-            .then(left.1.cmp(&right.1))
-    })?;
+    let winner = counts
+        .into_values()
+        .max_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)))?;
     let mut chosen = cluster.first()?.clone();
     chosen.text = winner.2;
     chosen.end = cluster.last()?.end.clone();
@@ -424,7 +477,10 @@ fn vote_text_cluster(cluster: Vec<SubtitleEntry>) -> Option<SubtitleEntry> {
 }
 
 fn is_ocr_overlay(text: &str) -> bool {
-    let east_asian = text.chars().filter(|character| is_east_asian(*character)).count();
+    let east_asian = text
+        .chars()
+        .filter(|character| is_east_asian(*character))
+        .count();
     let latin = text
         .chars()
         .filter(|character| character.is_ascii_alphabetic())
@@ -469,8 +525,48 @@ fn trim_ocr_overlays(entries: &[SubtitleEntry]) -> Vec<SubtitleEntry> {
     });
     if let Some((index, _)) = credit_roll {
         kept.truncate(index);
+        return kept;
+    }
+
+    // Credit rolls do not always begin after a clean gap and many names are not
+    // all-caps.  Near the end of a feature, classify a sustained Latin-heavy
+    // window as credits, but never use a single foreign sign as the boundary.
+    if let Some(index) = dense_credit_roll_start(&kept, end_time) {
+        kept.truncate(index);
     }
     kept
+}
+
+fn dense_credit_roll_start(entries: &[SubtitleEntry], end_time: f64) -> Option<usize> {
+    if entries.len() < 8 || end_time <= 0.0 {
+        return None;
+    }
+    let window = 10usize;
+    for index in 0..entries.len().saturating_sub(7) {
+        if time_to_secs(&entries[index].start) < end_time * 0.80 {
+            continue;
+        }
+        let sample = &entries[index..(index + window).min(entries.len())];
+        if sample.len() < 8 {
+            continue;
+        }
+        let credit_like = sample
+            .iter()
+            .filter(|entry| {
+                let east_asian = entry.text.chars().filter(|c| is_east_asian(*c)).count();
+                let latin = entry
+                    .text
+                    .chars()
+                    .filter(|c| c.is_ascii_alphabetic())
+                    .count();
+                is_credit_line(&entry.text) || (east_asian == 0 && latin >= 4)
+            })
+            .count();
+        if credit_like * 10 >= sample.len() * 7 {
+            return Some(index);
+        }
+    }
+    None
 }
 
 #[derive(Debug, Deserialize)]
@@ -597,7 +693,11 @@ fn vote_ocr_frames(frames: &[OcrObservationJson], interval: f64) -> Vec<Subtitle
         if let Some(index) = track_index {
             let track = &mut tracks[index];
             if ocr_texts_match(&track.last_text, &preview) {
-                track.segments.last_mut().expect("track has a segment").push(atom);
+                track
+                    .segments
+                    .last_mut()
+                    .expect("track has a segment")
+                    .push(atom);
             } else {
                 track.segments.push(vec![atom]);
             }
@@ -672,10 +772,11 @@ fn group_stacked_lines(lines: &[OcrLineJson]) -> Vec<Vec<&OcrLineJson>> {
     });
     let mut groups: Vec<Vec<&OcrLineJson>> = Vec::new();
     for line in ordered {
-        if let Some(group) = groups
-            .iter_mut()
-            .find(|group| group.iter().any(|existing| lines_are_stacked(existing, line)))
-        {
+        if let Some(group) = groups.iter_mut().find(|group| {
+            group
+                .iter()
+                .any(|existing| lines_are_stacked(existing, line))
+        }) {
             group.push(line);
         } else {
             groups.push(vec![line]);
@@ -998,7 +1099,10 @@ mod tests {
         assert!(!text.contains("Daigo"));
         assert!(text.contains("孩提时感受到的冬季"));
         assert!(text.contains("老爸"));
-        assert_eq!(text.lines().filter(|line| line.contains("的时候")).count(), 1);
+        assert_eq!(
+            text.lines().filter(|line| line.contains("的时候")).count(),
+            1
+        );
         assert_eq!(
             text.lines()
                 .filter(|line| line.contains("细致地进行"))
@@ -1010,6 +1114,32 @@ mod tests {
             1,
             "the two husband readings must collapse to one cue; confidence, not order, decides the character"
         );
+    }
+
+    #[test]
+    fn ocr_clean_separates_visual_labels_from_dialogue() {
+        let entries = vec![
+            cue(10.0, 12.0, "SNACK PUB ARMONIA 两年前去世的母亲留给我的房子"),
+            cue(14.0, 16.0, "不会整理得这么干净了 CERTS"),
+        ];
+        let cleaned = clean_ocr_entries(&entries);
+        assert_eq!(cleaned[0].text, "两年前去世的母亲留给我的房子");
+        assert_eq!(cleaned[1].text, "不会整理得这么干净了");
+    }
+
+    #[test]
+    fn dense_latin_tail_is_classified_as_credit_roll() {
+        let mut entries = vec![cue(10.0, 12.0, "故事仍在继续")];
+        for index in 0..10 {
+            entries.push(cue(
+                90.0 + index as f64,
+                90.8 + index as f64,
+                &format!("CAST MEMBER {index}"),
+            ));
+        }
+        let cleaned = clean_ocr_entries(&entries);
+        assert_eq!(cleaned.len(), 1);
+        assert_eq!(cleaned[0].text, "故事仍在继续");
     }
 
     #[test]

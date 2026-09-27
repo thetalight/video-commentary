@@ -143,6 +143,28 @@ fn default_narrative_layer() -> String {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct BeatResponse {
     beats: Vec<StoryBeat>,
+    #[serde(default)]
+    omission_reason: String,
+}
+
+#[derive(Debug, Serialize)]
+struct MapCoverageItem {
+    chunk_index: usize,
+    core_start: f64,
+    core_end: f64,
+    core_cues: usize,
+    core_chars: usize,
+    accepted_beats: usize,
+    omission_reason: String,
+}
+
+#[derive(Debug, Serialize)]
+struct MapCoverageAudit {
+    chunk_count: usize,
+    reviewed_chunks: usize,
+    chunks_with_beats: usize,
+    chunks_explicitly_omitted: usize,
+    items: Vec<MapCoverageItem>,
 }
 
 /// A beat-level dialogue attribution is deliberately separate from the source
@@ -331,6 +353,7 @@ pub async fn generate_plan(
     options: &DirectorOptions,
     director_root: &Path,
 ) -> Result<(EditPlan, Vec<ExcludedRange>), String> {
+    let director_title = safe_director_title(&options.title);
     let client = director_client(
         &options.provider,
         director_request_timeout(&options.provider),
@@ -349,7 +372,7 @@ pub async fn generate_plan(
         .join("\n");
     transcript_revision_input.push_str(&format!(
         "\nOPTIONS|{}|{:.3}|{}|{}",
-        options.title, options.duration, options.skip_intro_outro, options.skip_ads
+        director_title, options.duration, options.skip_intro_outro, options.skip_ads
     ));
     let resolved_model = match &backend {
         DirectorBackend::Ollama { model, .. } => model,
@@ -397,12 +420,16 @@ pub async fn generate_plan(
 
     // Keep MAP requests small enough that a detailed beat list can still close
     // its JSON object before the model output limit.
-    let chunks = transcript_chunks(&content_entries, 12_000);
+    // A feature film must be understood scene by scene.  Very large character
+    // chunks made local models collapse ten or more minutes into one summary and
+    // silently lose the opening.  Bound both text and elapsed time instead.
+    let chunks = transcript_chunks(&content_entries, 3_000);
     let mut beats: Vec<StoryBeat> = if let Some(beats) = checkpoint.read("beats.json") {
         task_events::emit_progress(app, Some(task_id), "director", 84.0, "已恢复剧情节拍检查点");
         beats
     } else {
         let mut mapped = Vec::new();
+        let mut coverage_items = Vec::new();
         for (index, chunk) in chunks.iter().enumerate() {
             task_events::emit_progress(
                 app,
@@ -420,7 +447,7 @@ pub async fn generate_plan(
                     &backend,
                     beat_system_prompt(),
                     &format!(
-                        "请提取 CORE 区间 {:.1}s–{:.1}s 中所有真正推动故事的节拍，不限制数量。CONTEXT 仅用于确认场景、说话对象和省略主语，不得从 CONTEXT 单独输出节拍。人物目标、阻力、选择、关系变化或后果每发生一次实质变化，就保留一个节拍；不要把寒暄和重复对白算作节拍。\n\n{}",
+                        "请提取 CORE 区间 {:.1}s–{:.1}s 中所有真正推动故事的节拍，不限制数量。CONTEXT 仅用于确认场景、说话对象和省略主语，不得从 CONTEXT 单独输出节拍。人物目标、阻力、选择、关系变化或后果每发生一次实质变化，就保留一个节拍；不要把寒暄和重复对白算作节拍。若 CORE 确实没有叙事变化，beats 返回空数组，并在 omission_reason 具体写明这是片头、演职员、重复寒暄、纯操作说明或其他什么内容；只要输出了 beat，omission_reason 必须为空。不得无理由跳过整个 CORE。\n\n{}",
                         chunk.core_start,
                         chunk.core_end,
                         chunk.text
@@ -434,10 +461,49 @@ pub async fn generate_plan(
                 checkpoint.write("director_map_chunk", &relative, &response)?;
                 response
             };
-            mapped.extend(response.beats.into_iter().filter(|beat| {
-                beat.start >= chunk.core_start - 0.5 && beat.start < chunk.core_end + 0.5
-            }));
+            let omission_reason = response.omission_reason.trim().to_string();
+            let accepted = response
+                .beats
+                .into_iter()
+                .filter(|beat| {
+                    beat.start >= chunk.core_start - 0.5 && beat.start < chunk.core_end + 0.5
+                })
+                .collect::<Vec<_>>();
+            if accepted.is_empty() && omission_reason.chars().count() < 4 {
+                return Err(format!(
+                    "剧情覆盖检查未通过：{:.1}–{:.1} 秒有 {} 条字幕，但 AI 未提取剧情节拍，也没有说明舍弃原因。检查点已保留，可直接重试 AI 导演",
+                    chunk.core_start, chunk.core_end, chunk.core_cues
+                ));
+            }
+            coverage_items.push(MapCoverageItem {
+                chunk_index: index + 1,
+                core_start: chunk.core_start,
+                core_end: chunk.core_end,
+                core_cues: chunk.core_cues,
+                core_chars: chunk.core_chars,
+                accepted_beats: accepted.len(),
+                omission_reason: if accepted.is_empty() {
+                    omission_reason
+                } else {
+                    String::new()
+                },
+            });
+            mapped.extend(accepted);
         }
+        let coverage = MapCoverageAudit {
+            chunk_count: coverage_items.len(),
+            reviewed_chunks: coverage_items.len(),
+            chunks_with_beats: coverage_items
+                .iter()
+                .filter(|item| item.accepted_beats > 0)
+                .count(),
+            chunks_explicitly_omitted: coverage_items
+                .iter()
+                .filter(|item| item.accepted_beats == 0 && !item.omission_reason.is_empty())
+                .count(),
+            items: coverage_items,
+        };
+        checkpoint.write("director_map_coverage", "map/coverage.json", &coverage)?;
         normalize_beats(&mut mapped, options.duration, &excluded);
         mapped
     };
@@ -499,7 +565,7 @@ pub async fn generate_plan(
             blueprint_system_prompt(),
             &format!(
                 "片名：{}\n风格：{}\n原片时长：{:.1} 秒\n解说总字数建议：{}–{} 字\n\n根据局部事实和对白归属表建立全片 Story Model。不要写旁白，不要决定剪辑段落；人物事实、关系和主题判断必须引用 beat_id：\n{}",
-                options.title,
+                director_title,
                 options.style,
                 options.duration,
                 min_narration_chars,
@@ -628,7 +694,7 @@ pub async fn generate_plan(
             story_plan_system_prompt(),
             &format!(
                 "片名：{}\n风格：{}\n原片时长：{:.1} 秒\n本片共有 {} 个 importance 4–5 的关键节拍。请输出 {}–{} 个 Narrative Unit：下限防止把完整电影压成剧情梗概，上限防止退化为一事件一句；只能依据实际节拍组织，不得用重复或空洞单元凑数。\n\n全片 Story Model：\n{}\n\n全部局部事实节拍与对白归属：\n{}\n\n请先取舍，再把服务同一戏剧目的的局部事件合成 Narrative Unit。不要写最终旁白。",
-                options.title,
+                director_title,
                 options.style,
                 options.duration,
                 essential_beat_count,
@@ -687,7 +753,7 @@ pub async fn generate_plan(
     );
     let chapters = build_story_chapters(&beats, &story_plan);
     let mut plan = EditPlan {
-        title: format!("{}｜{}", options.title, options.style),
+        title: format!("{}｜{}", director_title, options.style),
         style: options.style.clone(),
         target_duration_secs: 1.0,
         segments: Vec::new(),
@@ -799,7 +865,7 @@ pub async fn generate_plan(
             &chapter_system_prompt(&options.style, chapter_index == 0),
             &format!(
                 "片名：{}\n章节：{}/{}\n必须避开的区间：{}\n上一章结尾：{}\n本章交付预算：约 {} 字。每个 unit_id 的最低交付量已写进 JSON Schema：这是第一次写作的完整交付，不允许先交梗概再补写。\n各单元预算：{}\n\n全片 Story Model（人物身份合同）：\n{}\n\n全片 Story Plan（只用于理解前后文）：\n{}\n\n当前必须写成完整意群的 Narrative Units：\n{}\n\n这些 Units 引用的局部事实节拍：\n{}\n\n本章关键台词归属：\n{}\n\n本章字幕证据：\n{}\n\n字幕理解建议（仅解释歧义，不是身份合同；与 Story Model 冲突时不得采用）：{understanding_json}\n只生成本章 lines。",
-                options.title,
+                director_title,
                 chapter_index + 1,
                 chapters.len(),
                 excluded_note,
@@ -825,7 +891,7 @@ pub async fn generate_plan(
             &chapter_script,
         )?;
         let mut chapter_plan =
-            chapter_script_to_edit_plan(chapter_script, chapter, &options.title, &options.style)?;
+            chapter_script_to_edit_plan(chapter_script, chapter, &director_title, &options.style)?;
         let next_chapter_start = chapters
             .get(chapter_index + 1)
             .and_then(|next| next.beats.first())
@@ -840,7 +906,7 @@ pub async fn generate_plan(
             entries,
             chapter_beats,
             &excluded,
-            &options.title,
+            &director_title,
             &options.style,
             previous_chapter_end,
             next_chapter_start,
@@ -1016,7 +1082,7 @@ pub async fn generate_plan(
             chapter_plan = chapter_script_to_edit_plan(
                 repaired_script,
                 chapter,
-                &options.title,
+                &director_title,
                 &options.style,
             )?;
             finalize_plan(
@@ -1024,7 +1090,7 @@ pub async fn generate_plan(
                 entries,
                 chapter_beats,
                 &excluded,
-                &options.title,
+                &director_title,
                 &options.style,
                 previous_chapter_end,
                 next_chapter_start,
@@ -1050,7 +1116,7 @@ pub async fn generate_plan(
         entries,
         &beats,
         &excluded,
-        &options.title,
+        &director_title,
         &options.style,
         None,
         None,
@@ -1083,7 +1149,7 @@ pub async fn generate_plan(
         entries,
         &beats,
         &excluded,
-        &options.title,
+        &director_title,
         &options.style,
         None,
         None,
@@ -1106,24 +1172,36 @@ pub async fn generate_plan(
         let pre_review_is_renderable = super::edit_timing::reserve_issues(&pre_review_plan)
             .into_iter()
             .all(|issue| issue.severity != super::edit_timing::ReserveSeverity::Blocking);
-        if pre_review_is_renderable
-            && validate_market_ready(&pre_review_plan, min_narration_chars, usable_seconds).is_ok()
-        {
-            checkpoint.write(
-                "full_review_rollback",
-                "full-review/rollback.json",
-                &json!({
-                    "reason": reviewed_error,
-                    "action": "整片评审结果未通过最终硬规则，已回滚到评审前安全版本"
-                }),
-            )?;
-            plan = pre_review_plan;
-        } else {
-            return Err(reviewed_error);
-        }
+        checkpoint.write(
+            "full_review_rejected",
+            "full-review/rejected.json",
+            &json!({
+                "reason": reviewed_error,
+                "pre_review_was_renderable": pre_review_is_renderable,
+                "action": "拒绝发布审校后仍不合格的稿件；不回滚到已知含错误或重复的旧稿"
+            }),
+        )?;
+        return Err(reviewed_error);
     }
     checkpoint.write("director_final_plan", "final-plan.json", &plan)?;
     Ok((plan, excluded))
+}
+
+fn safe_director_title(title: &str) -> String {
+    let trimmed = title.trim();
+    let looks_like_site_boilerplate = [
+        "海量高清视频免费在线观看",
+        "免费视频在线观看",
+        "在线观看",
+        "爱壹帆国际版",
+    ]
+    .iter()
+    .any(|marker| trimmed.contains(marker));
+    if trimmed.is_empty() || looks_like_site_boilerplate {
+        "片名未确认".to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 async fn resolve_backend(
@@ -1490,11 +1568,11 @@ async fn chat_content(
 }
 
 fn beat_system_prompt() -> &'static str {
-    "你是影视事实记录员。输入是连续场景字幕，其中 CORE 是本轮可输出区间，CONTEXT 只用于理解前后场景与省略主语。只提取字幕直接证明的局部事件，不写解说、不规划成片、不编造身份、心理、动机、因果或结局。每个节拍只说明‘谁在什么处境中做了什么→出现了什么可观察变化’；没有可观察变化的操作步骤、问候、报价、重复说明和哲学扩写不是独立节拍。旧字幕中可能存在的自动聚类编号已被程序移除，因为它们不稳定且不是人物身份。只有连续字幕中的姓名、称呼或明确问答关系能同时证明身份与动作时才能点名；日语省略主语时宁可写‘对方、同事、家属、现场的人’，不得把当前话题人物自动当作说话者。第一人称‘我留下了孩子’只属于当前说话者，绝不能自动改写成主角童年。summary 禁止‘这揭示了、这反映了、为后续埋下伏笔、迫使他重新审视、内心冲突、存在意义’等分析评论，只记录事实变化。importance 为 1–5：5只给改变主线或兑现核心伏笔的事件，1只给可删除细节。start/end 必须取自能直接证明事件的 CORE 字幕时间，通常4–20秒，单个节拍不得超过35秒；更长场景要按实际变化拆分。quote 只填写字幕中确实出现、单独听仍有情绪或叙事价值的完整关键台词，否则留空。narrative_layer 必须标为 main、framing、in_world_media、flashback 或 uncertain：演员采访、节目导语、幕后说明、预告和主线开始前播放的片中节目都属于 framing；角色正在观看且会推动主线的电视内容才属于 in_world_media。绝不能把 framing 或 in_world_media 里的人物动作写成主角亲身经历。忽略片头曲、片尾曲、预告、广告、赞助、下载引导、寒暄和重复口播。"
+    "你是影视事实记录员。输入是连续场景字幕，其中 CORE 是本轮可输出区间，CONTEXT 只用于理解前后场景与省略主语。只提取字幕直接证明的局部事件，不写解说、不规划成片、不编造身份、心理、动机、因果或结局。每个节拍只说明‘谁在什么处境中做了什么→出现了什么可观察变化’；没有可观察变化的操作步骤、问候、报价、重复说明和哲学扩写不是独立节拍。旧字幕中可能存在的自动聚类编号已被程序移除，因为它们不稳定且不是人物身份。只有连续字幕中的姓名、称呼或明确问答关系能同时证明身份与动作时才能点名；日语省略主语时宁可写‘对方、同事、家属、现场的人’，不得把当前话题人物自动当作说话者。第一人称‘我留下了孩子’只属于当前说话者，绝不能自动改写成主角童年。summary 禁止‘这揭示了、这反映了、为后续埋下伏笔、迫使他重新审视、内心冲突、存在意义’等分析评论，只记录事实变化。importance 为 1–5：5只给改变主线或兑现核心伏笔的事件，1只给可删除细节。start/end 必须取自能直接证明事件的 CORE 字幕时间，通常4–20秒，单个节拍不得超过35秒；更长场景要按实际变化拆分。quote 只填写字幕中确实出现、单独听仍有情绪或叙事价值的完整关键台词，否则留空。narrative_layer 必须标为 main、framing、in_world_media、flashback 或 uncertain：演员采访、节目导语、幕后说明、预告和主线开始前播放的片中节目都属于 framing；角色正在观看且会推动主线的电视内容才属于 in_world_media。绝不能把 framing 或 in_world_media 里的人物动作写成主角亲身经历。忽略片头曲、片尾曲、预告、广告、赞助、下载引导、寒暄和重复口播。每个 CORE 必须被审阅：有剧情变化就输出 beats；没有则输出具体 omission_reason，不能静默丢弃。"
 }
 
 fn dialogue_attribution_system_prompt() -> &'static str {
-    "你是电影对白归属编辑。输入是按时间排列、已附原字幕证据的剧情节拍。每个 beat_id 至少返回一条归属判断；同一节拍里凡会被用于判断人物身份、人物关系、行动主体或因果的关键台词，都要各自返回，最多三条。不能漏掉任何 beat_id。evidence_quote 必须逐字复制该节拍 evidence 中的单条原字幕，不得改写或跨行拼接。speaker 表示这句话是谁说的，addressee 表示主要说给谁听：只能依据相邻问答、直接称呼、第一/第二人称承接、人物出入场和本批次已出现的连续状态判断，不得调用电影常识。能由字幕明确确认时使用姓名或稳定身份；只能判断是同一现场人物但不知道身份时使用自然中性称呼；无法确认就写‘身份未确认’，绝不能把台词谈论的人当成说话者。confidence 为0到1；低于0.8或存在冲突时，speaker 必须写‘身份未确认’，并在 uncertainty 简短说明缺少什么证据。addressee 不明确时写‘未确认’。未进入本表的台词只能作为场景上下文，不能证明人物身份、关系或说话对象。这一步只建立派生理解，不修改原字幕、不写旁白。"
+    "你是电影对白归属编辑。输入是按时间排列、已附原字幕证据的剧情节拍。每个 beat_id 至少返回一条归属判断；同一节拍里凡会被用于判断人物身份、人物关系、行动主体或因果的关键台词，都要各自返回，最多三条。不能漏掉任何 beat_id。evidence_quote 必须逐字复制该节拍 evidence 中的单条原字幕，不得改写或跨行拼接。speaker 表示这句话是谁说的，addressee 表示主要说给谁听：只能依据相邻问答、直接称呼、第一/第二人称承接、人物出入场和本批次已出现的连续状态判断，不得调用电影常识。能由字幕明确确认时使用姓名或稳定身份；只能判断是同一现场人物但不知道身份时使用自然中性称呼；无法确认就写‘身份未确认’，绝不能把台词谈论的人当成说话者。说话人和听话人不能写成同一个具体人物；台词正在称呼的人通常是 addressee，不是 speaker；已被本批上下文明确说明死亡、离场或不在场的人不能被判为当前说话者，除非字幕明确进入闪回。confidence 为0到1；只有至少两条相互独立的字幕线索一致时才允许 confidence≥0.8，模型直觉或剧情摘要不算证据。存在冲突时，speaker 必须写‘身份未确认’，并在 uncertainty 简短说明缺少什么证据。addressee 不明确时写‘未确认’。未进入本表的台词只能作为场景上下文，不能证明人物身份、关系或说话对象。这一步只建立派生理解，不修改原字幕、不写旁白。"
 }
 
 fn blueprint_system_prompt() -> &'static str {
@@ -1679,9 +1757,10 @@ fn beat_schema() -> Value {
                     },
                     "required": ["start", "end", "summary", "importance", "quote", "kind", "narrative_layer"]
                 }
-            }
+            },
+            "omission_reason": {"type": "string"}
         },
-        "required": ["beats"]
+        "required": ["beats", "omission_reason"]
     })
 }
 
@@ -1942,6 +2021,8 @@ fn fact_check_schema() -> Value {
 struct TranscriptChunk {
     core_start: f64,
     core_end: f64,
+    core_cues: usize,
+    core_chars: usize,
     text: String,
 }
 
@@ -1963,7 +2044,15 @@ fn transcript_chunks(entries: &[SubtitleEntry], max_chars: usize) -> Vec<Transcr
     let mut chars = 0usize;
     for (index, entry) in entries.iter().enumerate() {
         let line_chars = transcript_line(entry, "CORE").len();
-        if index > start && chars + line_chars > max_chars {
+        let elapsed =
+            subtitle::time_to_secs(&entry.start) - subtitle::time_to_secs(&entries[start].start);
+        let previous_gap = if index > start {
+            subtitle::time_to_secs(&entry.start) - subtitle::time_to_secs(&entries[index - 1].end)
+        } else {
+            0.0
+        };
+        let scene_boundary = previous_gap >= 18.0 && chars >= 240;
+        if index > start && (chars + line_chars > max_chars || elapsed >= 180.0 || scene_boundary) {
             ranges.push((start, index));
             start = index;
             chars = 0;
@@ -2003,6 +2092,11 @@ fn transcript_chunks(entries: &[SubtitleEntry], max_chars: usize) -> Vec<Transcr
             TranscriptChunk {
                 core_start,
                 core_end,
+                core_cues: end - start,
+                core_chars: entries[start..end]
+                    .iter()
+                    .map(|entry| entry.text.chars().count())
+                    .sum(),
                 text,
             }
         })
@@ -2126,6 +2220,7 @@ async fn build_dialogue_attributions(
             } else {
                 0.0
             };
+            enforce_attribution_guards(&mut attribution);
             if attribution.confidence < 0.8 || !attribution.uncertainty.is_empty() {
                 attribution.speaker = "身份未确认".to_string();
             }
@@ -2144,13 +2239,16 @@ async fn build_dialogue_attributions(
             }
         }
         for beat in batch {
-            let Some(attributions) = accepted.remove(&beat.id) else {
-                return Err(format!(
-                    "对白归属未通过：剧情节拍 {} 缺少可逐字匹配的说话人判断。原字幕和检查点均已保留，可直接重试 AI 导演",
-                    beat.id
-                ));
-            };
-            collected.extend(attributions);
+            if let Some(attributions) = accepted.remove(&beat.id) {
+                collected.extend(attributions);
+            } else {
+                // Attribution is a derived aid, not a prerequisite for a factual
+                // beat.  A model may merge two adjacent subtitle lines or select
+                // no usable quote.  Preserve a real line as traceable evidence,
+                // but explicitly deny it naming authority instead of blocking the
+                // entire feature or guessing a person.
+                collected.push(unresolved_attribution(beat));
+            }
         }
     }
     checkpoint.write(
@@ -2159,6 +2257,52 @@ async fn build_dialogue_attributions(
         &collected,
     )?;
     Ok(collected)
+}
+
+fn normalize_person_label(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| {
+            !character.is_whitespace() && !matches!(character, '：' | ':' | '，' | ',')
+        })
+        .collect::<String>()
+        .to_lowercase()
+}
+
+fn unresolved_attribution(beat: &StoryBeat) -> DialogueAttribution {
+    DialogueAttribution {
+        beat_id: beat.id.clone(),
+        evidence_quote: beat
+            .evidence
+            .first()
+            .map(|line| evidence_line_text(line))
+            .unwrap_or_default(),
+        speaker: "身份未确认".to_string(),
+        addressee: "未确认".to_string(),
+        confidence: 0.0,
+        uncertainty:
+            "模型没有提供可逐字匹配的单条字幕归属，已安全降级；该记录不能证明人物身份或关系"
+                .to_string(),
+    }
+}
+
+fn evidence_line_text(line: &str) -> String {
+    line.split_once("] ")
+        .map(|(_, text)| text.trim().to_string())
+        .unwrap_or_else(|| line.trim().to_string())
+}
+
+fn enforce_attribution_guards(attribution: &mut DialogueAttribution) {
+    if attribution.speaker != "身份未确认"
+        && attribution.addressee != "未确认"
+        && normalize_person_label(&attribution.speaker)
+            == normalize_person_label(&attribution.addressee)
+    {
+        attribution.confidence = attribution.confidence.min(0.49);
+        attribution.uncertainty = "说话人与听话人被标成同一人物，归属存在逻辑冲突".to_string();
+        attribution.speaker = "身份未确认".to_string();
+        attribution.addressee = "未确认".to_string();
+    }
 }
 
 fn normalize_for_evidence(value: &str) -> String {
@@ -4430,6 +4574,69 @@ mod tests {
         };
         assert!(attribution_quote_matches(&beat, "你到底在做什么工作？"));
         assert!(!attribution_quote_matches(&beat, "她已经知道全部真相"));
+    }
+
+    #[test]
+    fn dialogue_attribution_rejects_self_address_as_high_confidence() {
+        let mut attribution = DialogueAttribution {
+            beat_id: "B0001".into(),
+            evidence_quote: "是你的围巾吧".into(),
+            speaker: "美香".into(),
+            addressee: " 美香 ".into(),
+            confidence: 0.96,
+            uncertainty: String::new(),
+        };
+        enforce_attribution_guards(&mut attribution);
+        assert_eq!(attribution.speaker, "身份未确认");
+        assert_eq!(attribution.addressee, "未确认");
+        assert!(attribution.confidence < 0.8);
+        assert!(!attribution.uncertainty.is_empty());
+    }
+
+    #[test]
+    fn missing_single_line_attribution_degrades_without_losing_traceability() {
+        let beat = StoryBeat {
+            id: "B0015".into(),
+            start: 984.8,
+            end: 1007.2,
+            summary: "角色卖掉大提琴后感到轻松".into(),
+            importance: 5,
+            quote: "自己以前坚信不疑的梦想 可能 根本不是梦想".into(),
+            kind: "turning_point".into(),
+            narrative_layer: "main".into(),
+            evidence: vec![
+                "[984.8s-988.5s] 我打算迎来人生最大的转折点".into(),
+                "[1001.2s-1003.5s] 自己以前坚信不疑的梦想".into(),
+                "[1004.2s-1007.2s] 可能 根本不是梦想".into(),
+            ],
+        };
+        assert!(!attribution_quote_matches(&beat, &beat.quote));
+        let fallback = unresolved_attribution(&beat);
+        assert_eq!(fallback.beat_id, "B0015");
+        assert_eq!(fallback.speaker, "身份未确认");
+        assert_eq!(fallback.confidence, 0.0);
+        assert_eq!(fallback.evidence_quote, "我打算迎来人生最大的转折点");
+    }
+
+    #[test]
+    fn map_chunks_are_bounded_by_scene_time_not_only_character_count() {
+        let entries = vec![
+            entry(1, 0.0, 2.0, "第一场发生了变化"),
+            entry(2, 181.0, 183.0, "第二场发生了变化"),
+            entry(3, 362.0, 364.0, "第三场发生了变化"),
+        ];
+        let chunks = transcript_chunks(&entries, 3_000);
+        assert_eq!(chunks.len(), 3);
+        assert!(chunks.iter().all(|chunk| chunk.core_cues == 1));
+    }
+
+    #[test]
+    fn site_boilerplate_is_not_used_as_the_movie_title() {
+        assert_eq!(
+            safe_director_title("爱壹帆国际版-海量高清视频免费在线观看"),
+            "片名未确认"
+        );
+        assert_eq!(safe_director_title("入殓师"), "入殓师");
     }
 
     #[test]

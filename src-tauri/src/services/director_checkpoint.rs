@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::services::{jobs, task_store};
 
-pub const PROMPT_VERSION: &str = "director-v14-dialogue-attribution-no-asr";
+pub const PROMPT_VERSION: &str = "director-v15-scene-coverage-speaker-guards";
 const BEAT_COMPATIBLE_PROMPT_VERSIONS: &[&str] = &[];
 
 fn input_revision(

@@ -307,6 +307,11 @@ pub async fn refine(
             checkpoint.write("full_review_accepted", "full-review/accepted.json", &plan)?;
             return Ok(plan);
         }
+        // Keep a version containing all evidence-backed replacements before
+        // duplicate deletion.  If deletion alone would cross the release floor,
+        // retain only those duplicate paragraphs for this run; never throw away
+        // factual corrections together with them.
+        let replaced_only = proposed.clone();
         proposed.segments = proposed
             .segments
             .into_iter()
@@ -330,16 +335,11 @@ pub async fn refine(
             .sum::<usize>();
         if proposed_chars < narration_floor_chars {
             warnings.push(format!(
-                "整片评审会把旁白从制作预算压到 {} 字，低于发布下限 {} 字；已拒绝整轮修改并保留核验后的导演稿",
+                "整片评审删除重复段后为 {} 字，低于发布下限 {} 字；事实与人物修正已保留，本轮仅暂缓删除重复段，后续规划应从遗漏剧情补足而不是恢复错误文案",
                 proposed_chars, narration_floor_chars
             ));
-            checkpoint.write(
-                "full_review_warnings",
-                "full-review/warnings.json",
-                &warnings,
-            )?;
-            checkpoint.write("full_review_accepted", "full-review/accepted.json", &plan)?;
-            return Ok(plan);
+            plan = replaced_only;
+            continue;
         }
         plan = proposed;
     }
