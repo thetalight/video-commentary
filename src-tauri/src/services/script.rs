@@ -136,7 +136,53 @@ fn subtitle_windows(
     shots
 }
 
+/// Text evidence has no minimum shot length. A 0.5s reply can establish a fact;
+/// this does not make it a usable 1s visual clip. Until the v2 edit plan splits
+/// evidence_refs from visual selections, validate() below still checks both.
+pub fn validate_evidence(script: &Script, shots: &[Shot]) -> Result<(), String> {
+    if script.paragraphs.is_empty() {
+        return Err("文案没有解说段落".into());
+    }
+    for (i, paragraph) in script.paragraphs.iter().enumerate() {
+        if paragraph.narration.trim().is_empty() || paragraph.shot_ids.is_empty() {
+            return Err(format!("第{}段缺少文案或证据", i + 1));
+        }
+        let mut text = String::new();
+        for id in &paragraph.shot_ids {
+            let shot = shots
+                .get(*id)
+                .filter(|s| s.id == *id)
+                .ok_or("文案引用了不存在的字幕证据")?;
+            if !shot.start.is_finite()
+                || !shot.end.is_finite()
+                || shot.start < 0.0
+                || shot.end <= shot.start
+            {
+                return Err("字幕证据时间无效".into());
+            }
+            text.push_str(&shot.text);
+        }
+        let quote = normalized(&paragraph.evidence_quote);
+        // Short replies can be referenced alongside a full quote; they must not
+        // be discarded from evidence merely to satisfy rendering constraints.
+        // Full short utterances such as “不是” are useful evidence. Permit a
+        // <4-character quote only when it equals an entire referenced cue/window,
+        // not an arbitrary substring of a long line. Render validate keeps its
+        // legacy >=4 rule until evidence and visuals have separate schema fields.
+        let full_short_cue = !quote.is_empty()
+            && paragraph
+                .shot_ids
+                .iter()
+                .any(|id| normalized(&shots[*id].text) == quote);
+        if (quote.chars().count() < 4 && !full_short_cue) || !normalized(&text).contains(&quote) {
+            return Err(format!("第{}段证据引文无法在所选字幕中找到", i + 1));
+        }
+    }
+    Ok(())
+}
+
 pub fn validate(script: &Script, shots: &[Shot]) -> Result<(), String> {
+    validate_evidence(script, shots)?;
     if script.paragraphs.is_empty() {
         return Err("文案没有解说段落".into());
     }
@@ -162,7 +208,7 @@ pub fn validate(script: &Script, shots: &[Shot]) -> Result<(), String> {
                     .iter()
                     .any(|(a, b)| shot.start < *b && shot.end > *a)
             {
-                return Err("镜头时间无效或互相重叠".into());
+                return Err("画面窗口短于0.8秒、时间无效或重叠；短字幕可作证据，但当前旧版共用shot_ids，需在后续独立剪辑计划中配置相关完整画面，不能丢弃证据或放宽剪辑门槛".into());
             }
             used_ranges.push((shot.start, shot.end));
             if !used.insert(*id) || shot.start < previous_end {
@@ -382,6 +428,47 @@ mod tests {
         script.paragraphs[0].shot_ids = vec![0];
         script.paragraphs[0].evidence_quote = "登山者折断双腿".into();
         assert!(validate(&script, &shots).is_err());
+    }
+
+    #[test]
+    fn half_second_denial_is_valid_evidence_but_not_a_valid_visual_cut() {
+        let shots = vec![
+            Shot {
+                id: 0,
+                start: 10.0,
+                end: 20.0,
+                text: "他问她是不是要离开".into(),
+            },
+            Shot {
+                id: 1,
+                start: 24.0,
+                end: 24.5,
+                text: "不是".into(),
+            },
+        ];
+        let plan = Script {
+            title: "否定回答".into(),
+            paragraphs: vec![Paragraph {
+                narration: "她否认自己要离开。".into(),
+                evidence_quote: "她是不是要离开".into(),
+                shot_ids: vec![0, 1],
+            }],
+        };
+        validate_evidence(&plan, &shots).unwrap();
+        let mut short_quote = plan.clone();
+        short_quote.paragraphs[0].evidence_quote = "不是".into();
+        validate_evidence(&short_quote, &shots).unwrap();
+        short_quote.paragraphs[0].evidence_quote = "她是".into();
+        assert!(validate_evidence(&short_quote, &shots).is_err());
+        assert!(validate(&plan, &shots).unwrap_err().contains("画面窗口"));
+        assert!(timing(&[shots[1].clone()], 0.4).is_err());
+        let cue = SubtitleEntry {
+            index: 1,
+            start: "00:00:24,000".into(),
+            end: "00:00:24,500".into(),
+            text: "不是".into(),
+        };
+        assert_eq!(episode_shots(&[cue], 30.0, &[])[0].text, "不是");
     }
 
     #[test]

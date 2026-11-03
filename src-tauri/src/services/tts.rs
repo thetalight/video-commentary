@@ -117,28 +117,39 @@ fn synthesize(text: &str, voice: &str, output: &Path) -> Result<(), TtsError> {
 }
 
 fn validate_audio(path: &Path) -> Result<f64, TtsError> {
+    inspect_audio(path, None)
+}
+fn inspect_audio(path: &Path, report_path: Option<&Path>) -> Result<f64, TtsError> {
     let metadata = std::fs::metadata(path)?;
     if !metadata.is_file() || metadata.len() == 0 {
         return Err(TtsError::Failed("配音文件为空或不是普通文件".into()));
     }
-    let duration = crate::services::ffmpeg::get_duration(path)
-        .map_err(|error| TtsError::Failed(format!("配音文件不可读：{error}")))?;
-    if !duration.is_finite() || duration <= 0.0 {
-        return Err(TtsError::Failed("配音文件没有有效时长".into()));
+    let review = crate::services::technical_review::review_narration(path)
+        .map_err(|error| TtsError::Failed(format!("独立配音检查失败：{error}")))?;
+    if let Some(report_path) = report_path {
+        crate::services::jobs::atomic_write(
+            report_path,
+            serde_json::to_vec_pretty(&review)
+                .map_err(|_| TtsError::Failed("无法序列化独立配音检查报告".into()))?,
+        )?;
     }
-    Ok(duration)
+    if !review.blocking.is_empty() {
+        return Err(TtsError::Failed(review.blocking.join("；")));
+    }
+    Ok(review.duration)
 }
 
 pub fn cached_or_synthesize(text: &str, voice: &str, output: &Path) -> Result<PathBuf, TtsError> {
     let target = output.with_extension("aiff");
-    if validate_audio(&target).is_ok() && read_word_boundaries(&target).is_ok() {
+    let report_path = output.with_extension("audio-review.json");
+    if inspect_audio(&target, Some(&report_path)).is_ok() && read_word_boundaries(&target).is_ok() {
         return Ok(target);
     }
     let voice = validate_voice(voice).map_err(TtsError::Failed)?;
     let pending = PendingAudio::new(output.parent().unwrap_or_else(|| Path::new(".")))?;
     let staged = pending.0.join("narration.aiff");
     synthesize(text, voice, &staged)?;
-    let duration = validate_audio(&staged)?;
+    let duration = inspect_audio(&staged, Some(&report_path))?;
     let words = approximate_boundaries(text, duration);
     if words.is_empty() {
         return Err(TtsError::Failed("文案没有可配音的文字".into()));

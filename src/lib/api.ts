@@ -4,6 +4,7 @@ import type {
   DependencyStatus,
   ExistingJob,
   Episode,
+  ExclusionReport,
   LocalVoice,
   AiStatus,
   PrepareResult,
@@ -34,6 +35,7 @@ export const renderShort = (
   expectedRevision: string,
 ) => invoke<ShortsBundle>("render_short", { taskId, shortId, plan, expectedRevision });
 
+export const episodeExclusions = (taskId: string) => invoke<ExclusionReport>("episode_exclusions", { taskId });
 export const loadEpisode = (taskId: string) => invoke<Episode | null>("load_episode", { taskId });
 export const generateEpisode = (taskId: string, expectedRevision: string | null) =>
   invoke<Episode>("generate_episode", { taskId, expectedRevision });

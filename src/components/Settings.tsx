@@ -240,16 +240,17 @@ export function Settings() {
             </label>
 
             <label>
-              跳过片头 / 片尾
+              排除明确片头 / 片尾署名
               <select
                 value={config.skip_intro_outro ? "yes" : "no"}
                 onChange={(e) =>
                   setConfig({ ...config, skip_intro_outro: e.target.value === "yes" })
                 }
               >
-                <option value="yes">开启</option>
-                <option value="no">关闭</option>
+                <option value="yes">开启（仅明确署名的实际字幕区间）</option>
+                <option value="no">关闭（保留候选供核对）</option>
               </select>
+              <small>无可靠标记不固定裁掉开头或结尾；音乐、重复台词、完结提示不自动排除。更改会使选片材料变化的旧稿失效，需重新生成。</small>
             </label>
 
             <label>

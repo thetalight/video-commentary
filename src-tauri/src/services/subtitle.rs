@@ -355,60 +355,157 @@ fn is_credit_line(text: &str) -> bool {
     is_visual_overlay(text) && (text.contains('-') || uppercase >= 4)
 }
 
+/// Rule evidence, not a calibrated confidence probability. Uncertain markers are
+/// recorded but not applied. Never infer an entire opening/ending from one cue.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExclusionCandidate {
+    pub range: ExcludedRange,
+    pub cue_index: u32,
+    pub method: String,
+    pub reason: String,
+    pub applied: bool,
+}
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ExclusionReport {
+    pub policy_version: String,
+    pub source_duration: f64,
+    pub original_cue_count: usize,
+    pub original_ranges: Vec<ExcludedRange>,
+    pub candidates: Vec<ExclusionCandidate>,
+    pub applied_ranges: Vec<ExcludedRange>,
+    pub excluded_cue_positions: Vec<usize>,
+    pub retained_cue_positions: Vec<usize>,
+}
+
+pub fn exclusion_report(
+    entries: &[SubtitleEntry],
+    duration: f64,
+    skip_intro_outro: bool,
+    skip_ads: bool,
+) -> ExclusionReport {
+    let mut candidates = Vec::new();
+    for entry in entries {
+        let start = time_to_secs(&entry.start);
+        let end = time_to_secs(&entry.end);
+        if !duration.is_finite()
+            || !start.is_finite()
+            || !end.is_finite()
+            || start < 0.0
+            || end <= start
+            || end > duration
+        {
+            continue;
+        }
+        let edge_kind = if start <= 180.0 && is_intro_marker(&entry.text) {
+            Some("片头")
+        } else if start >= (duration - 240.0).max(duration * 0.7) && is_outro_marker(&entry.text) {
+            Some("片尾")
+        } else {
+            None
+        };
+        if let Some(kind) = edge_kind {
+            let explicit = explicit_credit_marker(&entry.text);
+            candidates.push(ExclusionCandidate {
+                range: ExcludedRange {
+                    start,
+                    end,
+                    kind: kind.into(),
+                },
+                cue_index: entry.index,
+                method: if explicit {
+                    "explicit_credit_label"
+                } else {
+                    "ambiguous_edge_marker"
+                }
+                .into(),
+                reason: if explicit {
+                    "字幕存在明确演职员/歌曲署名，仅处理该条实际区间，不向片头或片尾扩展"
+                } else {
+                    "音乐/完结提示等不足以证明该区间无剧情，保留供人工核对"
+                }
+                .into(),
+                applied: skip_intro_outro && explicit,
+            });
+        }
+        if is_ad_marker(&entry.text) {
+            candidates.push(ExclusionCandidate {
+                range: ExcludedRange {
+                    start,
+                    end,
+                    kind: "广告".into(),
+                },
+                cue_index: entry.index,
+                method: "ad_text_marker".into(),
+                reason: "字幕命中广告/下载引导标记，仅处理该条实际区间；不是画面识别".into(),
+                applied: skip_ads,
+            });
+        }
+    }
+    let applied_ranges = merge_ranges(
+        candidates
+            .iter()
+            .filter(|c| c.applied)
+            .map(|c| c.range.clone())
+            .collect(),
+    );
+    let (excluded_cue_positions, retained_cue_positions) = (0..entries.len()).partition(|i| {
+        let start = time_to_secs(&entries[*i].start);
+        let end = time_to_secs(&entries[*i].end);
+        applied_ranges
+            .iter()
+            .any(|range| start < range.end && end > range.start)
+    });
+    ExclusionReport {
+        policy_version: "marker-local-v2".into(),
+        source_duration: duration,
+        original_cue_count: entries.len(),
+        original_ranges: entries
+            .iter()
+            .map(|e| ExcludedRange {
+                start: time_to_secs(&e.start),
+                end: time_to_secs(&e.end),
+                kind: "原始字幕".into(),
+            })
+            .collect(),
+        candidates,
+        applied_ranges,
+        excluded_cue_positions,
+        retained_cue_positions,
+    }
+}
+
 pub fn detect_excluded_ranges(
     entries: &[SubtitleEntry],
     duration: f64,
     skip_intro_outro: bool,
     skip_ads: bool,
 ) -> Vec<ExcludedRange> {
-    let mut ranges = Vec::new();
-    if skip_intro_outro && duration >= 1_200.0 {
-        let intro_markers: Vec<&SubtitleEntry> = entries
-            .iter()
-            .filter(|entry| time_to_secs(&entry.start) <= 180.0 && is_intro_marker(&entry.text))
-            .collect();
-        let intro_end = intro_markers
-            .iter()
-            .map(|entry| time_to_secs(&entry.end) + 4.0)
-            .chain(entries.windows(2).filter_map(|pair| {
-                let left = pair[0].text.trim().to_lowercase();
-                let right = pair[1].text.trim().to_lowercase();
-                let end = time_to_secs(&pair[1].end);
-                (end <= 180.0 && left.len() >= 6 && left == right).then_some(end + 2.0)
-            }))
-            .fold(60.0_f64, f64::max)
-            .clamp(30.0, 180.0);
-        ranges.push(ExcludedRange {
-            start: 0.0,
-            end: intro_end,
-            kind: "片头".into(),
-        });
+    exclusion_report(entries, duration, skip_intro_outro, skip_ads).applied_ranges
+}
 
-        let outro_search_start = (duration - 240.0).max(duration * 0.7);
-        let marker_start = entries
-            .iter()
-            .filter(|entry| {
-                time_to_secs(&entry.start) >= outro_search_start && is_outro_marker(&entry.text)
-            })
-            .map(|entry| time_to_secs(&entry.start))
-            .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        ranges.push(ExcludedRange {
-            start: marker_start.unwrap_or((duration - 90.0).max(0.0)),
-            end: duration,
-            kind: "片尾".into(),
-        });
-    }
-
-    if skip_ads {
-        for entry in entries.iter().filter(|entry| is_ad_marker(&entry.text)) {
-            ranges.push(ExcludedRange {
-                start: (time_to_secs(&entry.start) - 3.0).max(0.0),
-                end: (time_to_secs(&entry.end) + 5.0).min(duration),
-                kind: "广告".into(),
-            });
-        }
-    }
-    merge_ranges(ranges)
+fn explicit_credit_marker(text: &str) -> bool {
+    let text = text
+        .trim()
+        .trim_matches(|c| matches!(c, '[' | ']' | '【' | '】' | '(' | ')' | '（' | '）'))
+        .trim();
+    [
+        "作词",
+        "作曲",
+        "演唱",
+        "领衔主演",
+        "演职员",
+        "制作人员",
+        "主题曲",
+        "片头曲",
+        "片尾曲",
+    ]
+    .iter()
+    .any(|label| {
+        text.strip_prefix(label).is_some_and(|rest| {
+            rest.is_empty()
+                || rest.starts_with(|c: char| c.is_whitespace() || matches!(c, ':' | '：'))
+        })
+    })
 }
 
 fn is_intro_marker(text: &str) -> bool {
@@ -478,7 +575,7 @@ fn merge_ranges(mut ranges: Vec<ExcludedRange>) -> Vec<ExcludedRange> {
     let mut merged: Vec<ExcludedRange> = Vec::new();
     for range in ranges {
         if let Some(previous) = merged.last_mut() {
-            if range.start <= previous.end + 5.0 && range.kind == previous.kind {
+            if range.start <= previous.end && range.kind == previous.kind {
                 previous.end = previous.end.max(range.end);
                 continue;
             }
@@ -563,20 +660,66 @@ mod tests {
     }
 
     #[test]
-    fn excludes_long_form_intro_outro_and_ads() {
+    fn excludes_only_explicit_marker_cues_without_swallowing_cold_open_or_epilogue() {
         let entries = vec![
             entry(1, 4.0, 8.0, "主题曲 演唱"),
             entry(2, 600.0, 604.0, "本节目由某品牌赞助播出"),
-            entry(3, 2_520.0, 2_524.0, "下集预告"),
+            entry(3, 2_520.0, 2_524.0, "制作人员：名单"),
+            entry(4, 2_530.0, 2_534.0, "人物在片尾继续交谈"),
         ];
         let ranges = detect_excluded_ranges(&entries, 2_600.0, true, true);
         assert!(ranges
             .iter()
-            .any(|range| range.kind == "片头" && range.start == 0.0));
+            .any(|range| range.kind == "片头" && range.start == 4.0 && range.end == 8.0));
         assert!(ranges.iter().any(|range| range.kind == "广告"));
         assert!(ranges
             .iter()
-            .any(|range| range.kind == "片尾" && range.end == 2_600.0));
+            .any(|range| range.kind == "片尾" && range.end == 2_524.0));
+    }
+
+    #[test]
+    fn unmarked_long_video_keeps_beginning_and_ending_and_reports_all_cues() {
+        let entries = vec![
+            entry(1, 2.0, 6.0, "冷开场重要剧情"),
+            entry(2, 2650.0, 2654.0, "结尾重要剧情"),
+        ];
+        let report = exclusion_report(&entries, 2700.0, true, true);
+        assert!(report.applied_ranges.is_empty());
+        assert_eq!(report.retained_cue_positions, vec![0, 1]);
+        assert_eq!(report.original_cue_count, 2);
+        assert_eq!(report.original_ranges.len(), 2);
+        let shots =
+            crate::services::script::episode_shots(&entries, 2700.0, &report.applied_ranges);
+        assert_eq!(shots.len(), 2);
+    }
+
+    #[test]
+    fn ambiguous_music_end_labels_and_dialogue_mentions_stay_in_material() {
+        let entries = vec![
+            entry(1, 3.0, 6.0, "♪"),
+            entry(2, 20.0, 24.0, "他讨论作曲的问题"),
+            entry(3, 2650.0, 2655.0, "本集完"),
+            entry(4, 2660.0, 2665.0, "♪"),
+        ];
+        let report = exclusion_report(&entries, 2700.0, true, false);
+        assert!(report.applied_ranges.is_empty());
+        assert!(report.candidates.iter().all(|c| !c.applied));
+        assert_eq!(report.retained_cue_positions.len(), 4);
+    }
+
+    #[test]
+    fn no_gap_padding_between_credit_cues_and_switch_off_keeps_candidates() {
+        let entries = vec![
+            entry(1, 4.0, 6.0, "作词：甲"),
+            entry(2, 7.0, 8.0, "这是冷开场对白"),
+            entry(3, 9.0, 11.0, "作曲：乙"),
+        ];
+        let report = exclusion_report(&entries, 2700.0, true, false);
+        assert_eq!(report.applied_ranges.len(), 2);
+        assert_eq!(report.retained_cue_positions, vec![1]);
+        let disabled = exclusion_report(&entries, 2700.0, false, false);
+        assert_eq!(disabled.candidates.len(), 2);
+        assert!(disabled.applied_ranges.is_empty());
     }
 
     #[test]
@@ -586,14 +729,13 @@ mod tests {
     }
 
     #[test]
-    fn repeated_early_lyrics_extend_intro_range() {
+    fn repeated_dialogue_alone_does_not_prove_intro() {
         let entries = vec![
             entry(1, 150.0, 160.0, "O'er the world's great"),
             entry(2, 160.0, 176.0, "O'er the world's great"),
             entry(3, 220.0, 224.0, "人物开始对话"),
         ];
         let ranges = detect_excluded_ranges(&entries, 2_600.0, true, false);
-        let intro = ranges.iter().find(|range| range.kind == "片头").unwrap();
-        assert!(intro.end >= 178.0);
+        assert!(ranges.is_empty());
     }
 }

@@ -1038,7 +1038,12 @@ pub fn render(
         let key = jobs::stable_hash(&[p.narration.as_bytes(), settings.voice.as_bytes()]);
         let audio = tts::cached_or_synthesize(&p.narration, &settings.voice, &cache.join(key))
             .map_err(|e| e.to_string())?;
-        let duration = ffmpeg::get_duration(&audio).map_err(|e| e.to_string())?;
+        let narration_review=technical_review::review_narration(&audio)?;
+        save(&root.join(format!("narration-review-{i:04}.json")),&narration_review)?;
+        if !narration_review.blocking.is_empty() {
+            return Err(format!("第{}段独立旁白未通过，尚未混入原声或BGM：{}",i+1,narration_review.blocking.join("；")));
+        }
+        let duration = narration_review.duration;
         let shots: Vec<_> = p
             .shot_ids
             .iter()

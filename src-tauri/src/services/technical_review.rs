@@ -3,7 +3,7 @@ use super::subtitle::{self, SubtitleEntry};
 use serde::{Deserialize, Serialize};
 use std::{path::Path, process::Command};
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Span {
     pub start: f64,
     pub end: f64,
@@ -79,30 +79,131 @@ fn overlap_seconds(span: &Span, narration: &[SubtitleEntry]) -> f64 {
     total
 }
 
-fn spans(stderr: &str, start_key: &str, end_key: &str) -> Vec<Span> {
-    let number =
-        regex::Regex::new(&format!(r"{}\s*:?\s*([0-9.]+)", regex::escape(start_key))).unwrap();
-    let end = regex::Regex::new(&format!(r"{}\s*:?\s*([0-9.]+)", regex::escape(end_key))).unwrap();
-    let starts = number
-        .captures_iter(stderr)
-        .filter_map(|c| c[1].parse().ok())
-        .collect::<Vec<_>>();
-    let ends = end
-        .captures_iter(stderr)
-        .filter_map(|c| c[1].parse().ok())
-        .collect::<Vec<_>>();
-    starts
-        .into_iter()
-        .zip(ends)
-        .filter_map(|(start, end)| (end > start).then_some(Span { start, end }))
-        .collect()
+/// Pair events in log order (not by zipping two independent lists). freezedetect
+/// can leave an open start at EOF; silence/black detectors may emit an end there.
+fn spans(stderr: &str, start_key: &str, end_key: &str, duration: f64) -> Vec<Span> {
+    if !duration.is_finite() || duration <= 0.0 {
+        return vec![];
+    }
+    let pattern = regex::Regex::new(&format!(
+        r"\b({}|{})\s*:?\s*(-?\d+(?:\.\d+)?)",
+        regex::escape(start_key),
+        regex::escape(end_key)
+    ))
+    .unwrap();
+    let mut active: Option<f64> = None;
+    let mut result = Vec::new();
+    for capture in pattern.captures_iter(stderr) {
+        let Ok(value) = capture[2].parse::<f64>() else {
+            continue;
+        };
+        if !value.is_finite() {
+            continue;
+        }
+        let value = value.clamp(0.0, duration);
+        if &capture[1] == start_key {
+            active = Some(active.map_or(value, |old| old.min(value)));
+        } else if let Some(start) = active.take() {
+            if value > start {
+                result.push(Span { start, end: value });
+            }
+        }
+    }
+    if let Some(start) = active {
+        if duration > start {
+            result.push(Span {
+                start,
+                end: duration,
+            });
+        }
+    }
+    result
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct NarrationReview {
+    pub method: String,
+    pub duration: f64,
+    pub peak_db: Option<f64>,
+    pub silences: Vec<Span>,
+    pub audible_seconds: f64,
+    pub blocking: Vec<String>,
+    pub semantic_coverage_verified: bool,
+}
+fn narration_report(log: &str, duration: f64) -> NarrationReview {
+    let pattern = regex::Regex::new(r"max_volume:\s*(-?\d+(?:\.\d+)?|-inf)\s*dB").unwrap();
+    let peak = pattern
+        .captures_iter(log)
+        .last()
+        .and_then(|c| c[1].parse::<f64>().ok())
+        .filter(|n| n.is_finite());
+    let silence = spans(log, "silence_start", "silence_end", duration);
+    let silent_seconds: f64 = silence.iter().map(|s| s.end - s.start).sum();
+    let audible = (duration - silent_seconds).max(0.0);
+    let mut blocking = Vec::new();
+    if !duration.is_finite() || duration <= 0.0 {
+        blocking.push("独立旁白时长无效".into());
+    }
+    if peak.is_none_or(|db| db <= -50.0) || audible < 0.08 || silent_seconds >= duration * 0.95 {
+        blocking.push("独立旁白没有足够可检测声音，禁止依靠原声或BGM掩盖".into());
+    }
+    for span in &silence {
+        let edge = span.start <= 0.05 || span.end >= duration - 0.05;
+        if span.end - span.start >= if edge { 2.0 } else { 3.0 } {
+            blocking.push(format!(
+                "独立旁白 {:.2}–{:.2} 秒异常静音，请试听核对",
+                span.start, span.end
+            ));
+        }
+    }
+    NarrationReview {
+        method: "decode+volumedetect+silencedetect(-50dB,0.2s)-v1".into(),
+        duration,
+        peak_db: peak,
+        silences: silence,
+        audible_seconds: audible,
+        blocking,
+        semantic_coverage_verified: false,
+    }
+}
+
+/// Inspect the original TTS track only, before adding source audio or music.
+/// Sound energy is NOT proof of speech recognition or complete text reading.
+pub fn review_narration(path: &Path) -> Result<NarrationReview, String> {
+    let duration = super::ffmpeg::get_duration(path).map_err(|e| e.to_string())?;
+    let ffmpeg = super::ffmpeg::resolve_ffmpeg_bin().ok_or("未找到可运行的FFmpeg")?;
+    let output = Command::new(ffmpeg)
+        .args(["-hide_banner", "-nostdin", "-xerror", "-i"])
+        .arg(path)
+        .args([
+            "-map",
+            "0:a:0",
+            "-vn",
+            "-af",
+            "silencedetect=n=-50dB:d=0.2,volumedetect",
+            "-f",
+            "null",
+            "-",
+        ])
+        .output()
+        .map_err(|_| "无法启动独立旁白解码检查".to_string())?;
+    if !output.status.success() {
+        return Err("独立旁白解码检查失败，不能继续混音".into());
+    }
+    Ok(narration_report(
+        &String::from_utf8_lossy(&output.stderr),
+        duration,
+    ))
 }
 
 pub fn review(path: &Path) -> Result<TechnicalReview, String> {
     let ffmpeg = super::ffmpeg::resolve_ffmpeg_bin().ok_or("未找到可运行的 FFmpeg")?;
+    let duration = super::ffmpeg::get_duration(path).map_err(|e| e.to_string())?;
     let output = Command::new(ffmpeg)
         .args([
             "-hide_banner",
+            "-nostdin",
+            "-xerror",
             "-i",
             path.to_str().unwrap_or_default(),
             "-vf",
@@ -123,10 +224,10 @@ pub fn review(path: &Path) -> Result<TechnicalReview, String> {
     }
     let log = String::from_utf8_lossy(&output.stderr);
     Ok(TechnicalReview {
-        duration: super::ffmpeg::get_duration(path).map_err(|e| e.to_string())?,
-        freezes: spans(&log, "freeze_start", "freeze_end"),
-        black_frames: spans(&log, "black_start", "black_end"),
-        silences: spans(&log, "silence_start", "silence_end"),
+        duration,
+        freezes: spans(&log, "freeze_start", "freeze_end", duration),
+        black_frames: spans(&log, "black_start", "black_end", duration),
+        silences: spans(&log, "silence_start", "silence_end", duration),
     })
 }
 
@@ -153,10 +254,108 @@ mod tests {
     }
 
     #[test]
-    fn parses_completed_spans_only() {
-        let s = "freeze_start: 1.2 freeze_end: 3.8 black_start:0 black_end:1 silence_start: 8";
-        assert_eq!(spans(s, "freeze_start", "freeze_end")[0].end, 3.8);
-        assert_eq!(spans(s, "silence_start", "silence_end").len(), 0);
+    fn closes_open_anomalies_at_eof_without_mispairing_orphans() {
+        let s="freeze_end: 0.5 freeze_start: 1.2 freeze_end: 3.8 freeze_start: 7 black_start:0 black_end:1 silence_start: 8";
+        let freezes = spans(s, "freeze_start", "freeze_end", 10.0);
+        assert_eq!(freezes.len(), 2);
+        assert_eq!(freezes[0].end, 3.8);
+        assert_eq!(freezes[1].end, 10.0);
+        assert_eq!(spans(s, "silence_start", "silence_end", 10.0)[0].end, 10.0);
+        assert_eq!(
+            spans("black_start:8", "black_start", "black_end", 10.0)[0].end,
+            10.0
+        );
+        assert!(spans(s, "silence_start", "silence_end", f64::NAN).is_empty());
+    }
+
+    #[test]
+    fn independent_narration_blocks_silence_even_if_other_tracks_have_sound() {
+        let silent = narration_report("silence_start:0\nmax_volume: -inf dB", 8.0);
+        assert!(!silent.blocking.is_empty());
+        assert_eq!(silent.audible_seconds, 0.0);
+        assert!(!silent.semantic_coverage_verified);
+        let tail = narration_report("max_volume: -8.0 dB\nsilence_start:5", 8.0);
+        assert!(tail.blocking.iter().any(|s| s.contains("异常静音")));
+        let healthy = narration_report("silence_start:0 silence_end:0.1 max_volume: -10.0 dB", 8.0);
+        assert!(healthy.blocking.is_empty());
+        assert!(!healthy.semantic_coverage_verified);
+        assert!(!narration_report("unknown detector output", 8.0)
+            .blocking
+            .is_empty());
+    }
+
+    #[test]
+    fn trailing_silence_is_blocking_only_when_narration_is_expected() {
+        let spans = spans("silence_start:8", "silence_start", "silence_end", 10.0);
+        let report = review(vec![], vec![], spans);
+        assert!(!report
+            .assess(&[caption("00:00:08,000", "00:00:10,000")])
+            .0
+            .is_empty());
+        assert!(report
+            .assess(&[caption("00:00:00,000", "00:00:07,000")])
+            .0
+            .is_empty());
+    }
+
+    /// Synthetic audio only; no say, source video, network, model or task writes.
+    #[test]
+    fn decodes_synthetic_pcm_and_rejects_all_silence_before_any_mix() {
+        if super::super::ffmpeg::resolve_ffmpeg_bin().is_none() {
+            return;
+        }
+        let root = std::env::temp_dir().join(format!(
+            "vc-audio-qc-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let wav = |tone: bool| {
+            let rate = 16000u32;
+            let count = rate as usize;
+            let data: Vec<u8> = (0..count)
+                .flat_map(|i| {
+                    let sample = if tone {
+                        (8000.0 * (i as f64 * 440.0 * std::f64::consts::TAU / rate as f64).sin())
+                            as i16
+                    } else {
+                        0
+                    };
+                    sample.to_le_bytes()
+                })
+                .collect();
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(b"RIFF");
+            bytes.extend_from_slice(&(36 + data.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(b"WAVEfmt ");
+            bytes.extend_from_slice(&16u32.to_le_bytes());
+            bytes.extend_from_slice(&1u16.to_le_bytes());
+            bytes.extend_from_slice(&1u16.to_le_bytes());
+            bytes.extend_from_slice(&rate.to_le_bytes());
+            bytes.extend_from_slice(&(rate * 2).to_le_bytes());
+            bytes.extend_from_slice(&2u16.to_le_bytes());
+            bytes.extend_from_slice(&16u16.to_le_bytes());
+            bytes.extend_from_slice(b"data");
+            bytes.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            bytes.extend(data);
+            bytes
+        };
+        let silence = root.join("silence.wav");
+        let tone = root.join("tone.wav");
+        std::fs::write(&silence, wav(false)).unwrap();
+        std::fs::write(&tone, wav(true)).unwrap();
+        let silent = review_narration(&silence).unwrap();
+        assert!(!silent.blocking.is_empty());
+        let audible = review_narration(&tone).unwrap();
+        assert!(audible.blocking.is_empty());
+        assert!(
+            !audible.semantic_coverage_verified,
+            "a tone is not verified speech"
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -30,6 +30,17 @@ export interface ExcludedRange {
   kind: string;
 }
 
+export interface ExclusionReport {
+  policy_version: string;
+  source_duration: number;
+  original_cue_count: number;
+  original_ranges: ExcludedRange[];
+  candidates: { range: ExcludedRange; cue_index: number; method: string; reason: string; applied: boolean }[];
+  applied_ranges: ExcludedRange[];
+  excluded_cue_positions: number[];
+  retained_cue_positions: number[];
+}
+
 export interface PrepareResult {
   task_id: string;
   job_dir: string;

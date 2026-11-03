@@ -30,6 +30,7 @@ pub fn run() {
             commands::pipeline::refetch_subtitles,
             commands::pipeline::delete_job,
             commands::pipeline::reveal_path,
+            commands::episode::episode_exclusions,
             commands::episode::load_episode,
             commands::episode::generate_episode,
             commands::episode::save_episode,
