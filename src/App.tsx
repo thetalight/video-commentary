@@ -1,9 +1,8 @@
 import { useEffect, useState } from "react";
 import { Settings } from "./components/Settings";
 import { TaskQueueList } from "./components/TaskQueueList";
-import { ReviewPanel } from "./components/ReviewPanel";
 import { IngestProgress } from "./components/StatusStepper";
-import { DirectorStage } from "./components/DirectorStage";
+import { EpisodeWorkspace } from "./components/EpisodeWorkspace";
 import { VideoPreview } from "./components/VideoPreview";
 import { TranscriptViewer } from "./components/TranscriptViewer";
 import { QueueFullError, useTaskQueue } from "./hooks/useTaskQueue";
@@ -32,9 +31,8 @@ export default function App() {
   useEffect(() => {
     if (selectedId && queue.tasks.some((t) => t.id === selectedId)) return;
     const pick =
-      queue.tasks.find((t) => t.status === "ready" && t.prepare?.plan) ||
-      queue.tasks.find((t) => t.status === "awaiting_director") ||
       queue.tasks.find((t) => t.status === "running") ||
+      queue.tasks.find((t) => t.status === "ready") ||
       queue.tasks[0];
     if (pick) setSelectedId(pick.id);
   }, [queue.tasks, selectedId]);
@@ -63,15 +61,15 @@ export default function App() {
           <div className="brand-icon">解</div>
           <div>
             <div className="eyebrow">VIDEO COMMENTARY STUDIO</div>
-            <h1>AI 解说导演</h1>
-            <p className="tagline">INGEST · AI DIRECTOR · REVIEW · RENDER</p>
+            <h1>AI 整集解说</h1>
+            <p className="tagline">INGEST · FULL STORY · REVIEW · 16:9 RENDER</p>
           </div>
         </div>
         <div className="header-system">
           <span className="system-dot" />
           <div>
             <strong>AI DIRECTOR</strong>
-            <span>本机 Ollama · AI 数据不上传云端</span>
+            <span>DeepSeek API · 字幕与文案文本会发送到配置的服务</span>
           </div>
         </div>
       </header>
@@ -81,8 +79,8 @@ export default function App() {
           <div className="panel-content">
             <div className="eyebrow">01 · INGEST</div>
             <div className="panel-intro">
-              <h2>创建导演任务</h2>
-              <p>粘贴链接后，应用自动完成下载、字幕、剧情节拍和导演脚本。</p>
+              <h2>创建解说任务</h2>
+              <p>粘贴链接后，应用自动完成下载和字幕；随后统一梳理整集故事、写一篇连续稿，审稿后生成约原片30%时长的横屏解说。</p>
             </div>
 
             <div className="create-card">
@@ -91,7 +89,7 @@ export default function App() {
                 <input
                   type="url"
                   className="input-lg"
-                  placeholder="粘贴 YouTube、Bilibili、一帆或其他视频链接"
+                  placeholder="粘贴 YouTube、Bilibili、一帆、努努影院或其他视频链接"
                   value={url}
                   onChange={(e) => setUrl(e.target.value)}
                   onKeyDown={(e) => {
@@ -101,7 +99,7 @@ export default function App() {
               </label>
 
               <label>
-                导演风格
+                解说风格
                 <select value={style} onChange={(e) => setStyle(e.target.value)}>
                   {STYLE_OPTIONS.map((s) => (
                     <option key={s} value={s}>
@@ -127,7 +125,7 @@ export default function App() {
                 onClick={handleStart}
                 disabled={queue.isQueueFull}
               >
-                开始 AI 导演
+                下载并准备素材
               </button>
             </div>
 
@@ -146,22 +144,8 @@ export default function App() {
 
         <section className="work-panel review-column">
           <div className="panel-content">
-            {selected?.kind === "prepare" &&
-            (selected.status === "queued" || selected.status === "running") ? (
-              <IngestProgress
-                status={selected.status}
-                progress={selected.progress}
-                kind={selected.kind}
-              />
-            ) : selected?.status === "awaiting_director" && selectedPrepare ? (
-              <DirectorStage
-                prepare={selectedPrepare}
-                status={selected.status}
-                progress={selected.progress}
-                error={selected.error}
-                onGenerate={queue.regenerateDirector}
-                onRefetchSubtitle={queue.refetchSubtitleTask}
-              />
+            {selected && (selected.status === "queued" || selected.status === "running") ? (
+              <IngestProgress status={selected.status} progress={selected.progress} />
             ) : selected?.status === "failed" ? (
               <section className="review-panel">
                 <div className="panel-intro">
@@ -174,65 +158,32 @@ export default function App() {
                     className="primary"
                     onClick={() => void queue.retryFailedTask(selected.id)}
                   >
-                    从失败阶段重试
+                    {selectedPrepare?.source_available ? "重试字幕准备" : "重新下载"}
                   </button>
-                  {selected.failedStage !== "director" &&
-                    selectedPrepare?.transcript_available && (
-                      <button
-                        type="button"
-                        onClick={() => void queue.regenerateDirector(selected.id)}
-                      >
-                        重新生成导演稿
-                      </button>
-                    )}
                 </div>
                 {selectedPrepare?.source_available && (
-                    <VideoPreview
-                      sourcePath={selectedPrepare.source_path}
-                      outputPath={selected.outputPath}
-                    />
+                  <VideoPreview sourcePath={selectedPrepare.source_path} />
                 )}
                 {selectedPrepare?.transcript_available && (
-                    <TranscriptViewer taskId={selectedPrepare.task_id} />
+                  <TranscriptViewer taskId={selectedPrepare.task_id} />
                 )}
                 {!selectedPrepare?.source_available && selected.url && (
                   <p className="queue-hint">重试后会使用原始播放链接重新下载视频。</p>
                 )}
               </section>
-            ) : selectedPrepare?.plan ? (
-              <ReviewPanel
+            ) : selected && selectedPrepare ? (
+              <EpisodeWorkspace
                 prepare={selectedPrepare}
-                status={selected?.status ?? "ready"}
-                progress={selected?.progress ?? null}
-                kind={selected?.kind}
-                outputPath={selected?.render?.output_path ?? selected?.outputPath}
-                rendering={selected?.kind === "render" && selected.status === "running"}
-                onPlanSaved={(prepare) => queue.updatePrepare(prepare.task_id, prepare)}
-                onRender={(prepare) => queue.enqueueRender(prepare)}
-                onRegenerate={queue.regenerateDirector}
-                onRefetchSubtitle={queue.refetchSubtitleTask}
+                status={selected.status}
+                progress={selected.progress}
+                onRefetchSubtitle={(taskId) => void queue.refetchSubtitleTask(taskId)}
+                onRenderedChange={(rendered) => queue.setShortsRendered(selected.id, rendered)}
               />
-            ) : selectedPrepare ? (
-              <section className="review-panel">
-                <div className="panel-intro">
-                  <h2>{selected?.status === "completed" ? "历史成片" : "历史素材"}</h2>
-                  <p>可以直接播放原视频或已经生成的成片。</p>
-                </div>
-                {selectedPrepare.source_available && (
-                  <VideoPreview
-                    sourcePath={selectedPrepare.source_path}
-                    outputPath={selected?.outputPath}
-                  />
-                )}
-                {selectedPrepare.transcript_available && (
-                  <TranscriptViewer taskId={selectedPrepare.task_id} />
-                )}
-              </section>
             ) : (
               <div className="online-task-empty">
                 <div className="empty-mark">⌁</div>
-                <h2>导演工作台待命</h2>
-                <p>选择左侧任务，逐段检查因果、选片和原声保留。</p>
+                <h2>解说工作台待命</h2>
+                <p>选择左侧任务，生成整集连续解说稿，通读审稿后生成横屏长视频。</p>
               </div>
             )}
           </div>

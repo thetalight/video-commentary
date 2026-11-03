@@ -1,7 +1,14 @@
 import hashlib
 import json
+import os
 import re
+import socket
+import subprocess
+import sys
+import time
 import urllib.parse
+import urllib.request
+from pathlib import Path
 
 from yt_dlp.extractor.common import InfoExtractor
 from yt_dlp.utils import ExtractorError
@@ -12,6 +19,8 @@ class YfspIE(InfoExtractor):
     _VALID_URL = r'https?://(?:(?:www|m)\.)?yfsp\.tv/play/(?P<id>[^/?#]+)'
     _BASE_URL = 'https://www.yfsp.tv'
     _PLAY_API = 'https://m10.yfsp.tv/v3/video/play'
+    _CHROME_PATH = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
+    _CHROME_WAIT_SECONDS = 180
     _UA = (
         'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
         'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36'
@@ -19,16 +28,399 @@ class YfspIE(InfoExtractor):
 
     def _verification_error(self):
         raise ExtractorError(
-            'YFSP verification required: open this page in Chrome, complete the '
-            'Cloudflare check, and select Chrome cookies in the app settings',
+            'YFSP verification required: complete the Cloudflare check in the '
+            'dedicated Chrome window opened by the app',
             expected=True,
         )
 
-    def _download_text(self, url, video_id, note, headers):
-        text = self._download_webpage(url, video_id, note=note, headers=headers)
+    def _download_text(
+        self,
+        url,
+        video_id,
+        note,
+        headers,
+        impersonate=None,
+        browser_fallback=False,
+    ):
+        text = None
+        for attempt in range(4):
+            try:
+                text = self._download_webpage(
+                    url,
+                    video_id,
+                    note=note if attempt == 0 else f'{note} (retry {attempt + 1}/4)',
+                    headers=headers,
+                    impersonate=impersonate,
+                    require_impersonation=bool(impersonate),
+                )
+                break
+            except ExtractorError as error:
+                retryable = re.search(
+                    r'(?:SSL_connect|SSL_ERROR_SYSCALL|connection closed|connection reset|'
+                    r'remote end closed|timed? out|TransportError|UNEXPECTED_EOF|'
+                    r'EOF occurred in violation of protocol)',
+                    str(error),
+                    re.I,
+                )
+                if retryable and attempt == 3 and browser_fallback:
+                    text = self._chrome_fetch_text(url, video_id, headers)
+                    break
+                if not retryable or attempt == 3:
+                    raise
+                time.sleep(2 ** attempt)
         if 'Just a moment...' in text or '__cf_chl_' in text:
             self._verification_error()
         return text
+
+    @staticmethod
+    def _local_json(url):
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(url, timeout=2) as response:
+            return json.load(response)
+
+    @staticmethod
+    def _free_local_port():
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(('127.0.0.1', 0))
+            return sock.getsockname()[1]
+
+    def _has_clearance_cookie(self):
+        return 'cf_clearance' in self._get_cookies(self._BASE_URL)
+
+    @staticmethod
+    def _chrome_profile_dir():
+        return Path(os.environ.get(
+            'YFSP_CHROME_PROFILE',
+            Path.home() / 'Library/Application Support/com.esun.video-commentary/yfsp-chrome-profile',
+        ))
+
+    @staticmethod
+    def _existing_chrome_cdp_port(profile_dir):
+        """Find Chrome already owning this profile and its debugging port."""
+        try:
+            output = subprocess.run(
+                ['/bin/ps', '-axo', 'command='],
+                capture_output=True,
+                text=True,
+                timeout=2,
+                check=False,
+            ).stdout
+        except (OSError, subprocess.SubprocessError):
+            return None
+
+        profile = str(profile_dir)
+        for line in output.splitlines():
+            if profile not in line:
+                continue
+            match = re.search(r'--remote-debugging-port=(\d+)', line)
+            if not match:
+                continue
+            port = int(match.group(1))
+            try:
+                version = YfspIE._local_json(f'http://127.0.0.1:{port}/json/version')
+            except Exception:
+                continue
+            if version.get('webSocketDebuggerUrl'):
+                return port
+        return None
+
+    @classmethod
+    def _start_chrome_session(cls, url, profile_dir):
+        existing_port = cls._existing_chrome_cdp_port(profile_dir)
+        if existing_port is not None:
+            return existing_port, None, False
+
+        port = cls._free_local_port()
+        process = subprocess.Popen(
+            [
+                cls._CHROME_PATH,
+                '--no-first-run',
+                '--no-default-browser-check',
+                f'--remote-debugging-port={port}',
+                f'--user-data-dir={profile_dir}',
+                url,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return port, process, True
+
+    @classmethod
+    def _ensure_chrome_page(cls, port, url):
+        """Create a page when an existing profile has no inspectable tab."""
+        try:
+            tabs = cls._local_json(f'http://127.0.0.1:{port}/json/list')
+        except Exception:
+            tabs = []
+        if any('yfsp.tv' in (tab.get('url') or '') for tab in tabs):
+            return
+        request = urllib.request.Request(
+            f'http://127.0.0.1:{port}/json/new?{urllib.parse.quote(url, safe="")}',
+            method='PUT',
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=5):
+                pass
+        except Exception:
+            # The normal launch path will still be able to report a useful
+            # timeout if Chrome refuses to create a target.
+            pass
+
+    def _import_cdp_cookies(self, cookies):
+        imported = 0
+        for cookie in cookies:
+            domain = cookie.get('domain') or ''
+            name = cookie.get('name')
+            value = cookie.get('value')
+            if 'yfsp.tv' not in domain or not name or value is None:
+                continue
+            expires = cookie.get('expires')
+            self._set_cookie(
+                domain,
+                name,
+                value,
+                expire_time=int(expires) if expires and expires > 0 else None,
+                path=cookie.get('path') or '/',
+                secure=bool(cookie.get('secure')),
+                discard=not bool(expires and expires > 0),
+                rest={'HttpOnly': None} if cookie.get('httpOnly') else {},
+            )
+            imported += 1
+        return imported
+
+    def _chrome_session(self, url, video_id, fallback_user_agent):
+        """Let Chrome solve Cloudflare and return decrypted YFSP cookies via CDP.
+
+        Recent Chromium releases on macOS may keep their cookie encryption key
+        in Apple Passwords/iCloud Keychain.  yt-dlp's --cookies-from-browser
+        cannot read that key, while Chrome itself can.  A dedicated persistent
+        profile plus the local DevTools protocol avoids exporting or decrypting
+        the user's normal browser database.
+        """
+        if self._has_clearance_cookie() or sys.platform != 'darwin':
+            return fallback_user_agent
+        if not os.path.isfile(self._CHROME_PATH):
+            return fallback_user_agent
+
+        try:
+            from websockets.sync.client import connect
+        except ImportError:
+            self.report_warning('Chrome cookie bridge unavailable: Python websockets is missing')
+            return fallback_user_agent
+
+        profile_dir = self._chrome_profile_dir()
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        port, process, owns_process = self._start_chrome_session(url, profile_dir)
+
+        browser_socket = None
+        imported = 0
+        user_agent = fallback_user_agent
+        deadline = time.monotonic() + self._CHROME_WAIT_SECONDS
+        self.to_screen(
+            f'{video_id}: Chrome verification window opened; complete the check if prompted')
+        try:
+            version = None
+            while time.monotonic() < deadline:
+                try:
+                    version = self._local_json(f'http://127.0.0.1:{port}/json/version')
+                    break
+                except Exception:
+                    if owns_process and process.poll() is not None:
+                        break
+                    time.sleep(0.25)
+            if not version or not version.get('webSocketDebuggerUrl'):
+                raise ExtractorError('Unable to start the YFSP Chrome verification session', expected=True)
+
+            user_agent = version.get('User-Agent') or fallback_user_agent
+            self._ensure_chrome_page(port, url)
+            browser_socket = connect(version['webSocketDebuggerUrl'], open_timeout=3)
+            request_id = 0
+            last_notice = 0
+            while time.monotonic() < deadline:
+                request_id += 1
+                browser_socket.send(json.dumps({'id': request_id, 'method': 'Storage.getCookies'}))
+                while True:
+                    message = json.loads(browser_socket.recv(timeout=3))
+                    if message.get('id') == request_id:
+                        break
+                cookies = message.get('result', {}).get('cookies', [])
+                has_clearance = any(
+                    cookie.get('name') == 'cf_clearance'
+                    and 'yfsp.tv' in (cookie.get('domain') or '')
+                    for cookie in cookies
+                )
+                try:
+                    tabs = self._local_json(f'http://127.0.0.1:{port}/json/list')
+                except Exception:
+                    tabs = []
+                page_ready = any(
+                    'yfsp.tv' in (tab.get('url') or '')
+                    and tab.get('title')
+                    and not re.search(
+                        r'(?:Just a moment|请稍候|404|服务器错误)',
+                        tab['title'],
+                        re.I,
+                    )
+                    for tab in tabs
+                )
+                if has_clearance and page_ready:
+                    imported = self._import_cdp_cookies(cookies)
+                    break
+                elapsed = int(self._CHROME_WAIT_SECONDS - (deadline - time.monotonic()))
+                if elapsed - last_notice >= 15:
+                    self.to_screen(f'{video_id}: Waiting for Chrome verification...')
+                    last_notice = elapsed
+                time.sleep(0.5)
+        finally:
+            if browser_socket is not None:
+                if owns_process:
+                    try:
+                        request_id += 1
+                        browser_socket.send(json.dumps({'id': request_id, 'method': 'Browser.close'}))
+                    except Exception:
+                        pass
+                try:
+                    browser_socket.close()
+                except Exception:
+                    pass
+            if owns_process:
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.terminate()
+
+        if not imported or not self._has_clearance_cookie():
+            raise ExtractorError(
+                'YFSP Chrome verification timed out; complete the check in the opened Chrome window',
+                expected=True,
+            )
+        self.to_screen(f'{video_id}: Chrome verification cookies imported')
+        return user_agent
+
+    def _chrome_fetch_text(self, url, video_id, headers):
+        """Fetch a YFSP API URL inside the verified Chrome page context.
+
+        Some proxy nodes abruptly close TLS handshakes made by curl_cffi or
+        Python/OpenSSL while allowing Chrome itself.  This is only a fallback
+        after four ordinary request attempts fail.
+        """
+        if sys.platform != 'darwin' or not os.path.isfile(self._CHROME_PATH):
+            raise ExtractorError('YFSP Chrome API fallback is unavailable', expected=True)
+        try:
+            from websockets.sync.client import connect
+        except ImportError as error:
+            raise ExtractorError(
+                'YFSP Chrome API fallback requires Python websockets',
+                expected=True,
+            ) from error
+
+        profile_dir = self._chrome_profile_dir()
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        referer = headers.get('Referer') or self._BASE_URL
+        port, process, owns_process = self._start_chrome_session(referer, profile_dir)
+
+        browser_socket = None
+        page_socket = None
+        deadline = time.monotonic() + 90
+        self.to_screen(f'{video_id}: Retrying YFSP API inside Chrome')
+        try:
+            version = None
+            while time.monotonic() < deadline:
+                try:
+                    version = self._local_json(f'http://127.0.0.1:{port}/json/version')
+                    break
+                except Exception:
+                    if owns_process and process.poll() is not None:
+                        break
+                    time.sleep(0.25)
+            if not version or not version.get('webSocketDebuggerUrl'):
+                raise ExtractorError('Unable to start Chrome for the YFSP API fallback', expected=True)
+
+            self._ensure_chrome_page(port, referer)
+            browser_socket = connect(version['webSocketDebuggerUrl'], open_timeout=3)
+            target = None
+            while time.monotonic() < deadline:
+                try:
+                    tabs = self._local_json(f'http://127.0.0.1:{port}/json/list')
+                except Exception:
+                    tabs = []
+                target = next((
+                    tab for tab in tabs
+                    if 'yfsp.tv' in (tab.get('url') or '')
+                    and tab.get('webSocketDebuggerUrl')
+                    and tab.get('title')
+                    and not re.search(
+                        r'(?:Just a moment|请稍候|404|服务器错误)',
+                        tab['title'],
+                        re.I,
+                    )
+                ), None)
+                if target:
+                    break
+                time.sleep(0.5)
+            if not target:
+                raise ExtractorError('The verified YFSP page did not become ready in Chrome', expected=True)
+
+            allowed_headers = {
+                key: value for key, value in headers.items()
+                if key.lower() in ('accept', 'x-requested-with')
+            }
+            fetch_options = {
+                'credentials': 'include',
+                'headers': allowed_headers,
+            }
+            expression = (
+                '(async () => {'
+                f'const response = await fetch({json.dumps(url)}, {json.dumps(fetch_options)});'
+                'return JSON.stringify({status: response.status, text: await response.text()});'
+                '})()'
+            )
+            page_socket = connect(target['webSocketDebuggerUrl'], open_timeout=3)
+            page_socket.send(json.dumps({
+                'id': 1,
+                'method': 'Runtime.evaluate',
+                'params': {
+                    'expression': expression,
+                    'awaitPromise': True,
+                    'returnByValue': True,
+                },
+            }))
+            while True:
+                message = json.loads(page_socket.recv(timeout=30))
+                if message.get('id') == 1:
+                    break
+            if message.get('result', {}).get('exceptionDetails'):
+                raise ExtractorError('Chrome could not fetch the YFSP play API', expected=True)
+            value = message.get('result', {}).get('result', {}).get('value')
+            payload = json.loads(value) if isinstance(value, str) else {}
+            status = int(payload.get('status') or 0)
+            if status < 200 or status >= 300:
+                raise ExtractorError(
+                    f'YFSP play API returned HTTP {status} inside Chrome',
+                    expected=True,
+                )
+            return payload.get('text') or ''
+        finally:
+            if page_socket is not None:
+                try:
+                    page_socket.close()
+                except Exception:
+                    pass
+            if browser_socket is not None:
+                if owns_process:
+                    try:
+                        browser_socket.send(json.dumps({'id': 99, 'method': 'Browser.close'}))
+                    except Exception:
+                        pass
+                try:
+                    browser_socket.close()
+                except Exception:
+                    pass
+            if owns_process:
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.terminate()
 
     @staticmethod
     def _signed_url(base_url, params, public_key, private_key):
@@ -61,8 +453,25 @@ class YfspIE(InfoExtractor):
             return None
         return value
 
+    @staticmethod
+    def _quality_labels(info):
+        """clarity / playingMedia 里的 title 是画质标签（576、720、蓝光…），不是片名。"""
+        labels = set()
+        playing = info.get('playingMedia')
+        if isinstance(playing, dict) and isinstance(playing.get('title'), str):
+            labels.add(playing['title'].strip())
+        clarity = info.get('clarity') if isinstance(info.get('clarity'), list) else []
+        for item in clarity:
+            if not isinstance(item, dict):
+                continue
+            for key in ('title', 'description', 'memo'):
+                if isinstance(item.get(key), str):
+                    labels.add(item[key].strip())
+        return {label for label in labels if label}
+
     @classmethod
-    def _metadata_title(cls, *sources):
+    def _metadata_title(cls, *sources, reject=None):
+        reject = reject or set()
         preferred = {
             'videoname', 'vodname', 'moviename', 'filmname', 'showname',
             'albumname', 'seriesname', 'title', 'name',
@@ -75,7 +484,7 @@ class YfspIE(InfoExtractor):
                     for key, item in value.items():
                         if str(key).lower() in preferred:
                             cleaned = cls._clean_title(item)
-                            if cleaned:
+                            if cleaned and cleaned not in reject:
                                 return cleaned
                     queue.extend(value.values())
                 elif isinstance(value, list):
@@ -167,21 +576,121 @@ class YfspIE(InfoExtractor):
                 if isinstance(item, dict) and item.get('url') not in existing_urls
             )
 
+    @staticmethod
+    def _subtitle_like_paths(value, prefix='', found=None):
+        """列出响应里所有「像字幕」的字段路径，便于排查平台到底有没有字幕。"""
+        if found is None:
+            found = []
+        if len(found) >= 200:
+            return found
+        if isinstance(value, dict):
+            for key, item in value.items():
+                path = f'{prefix}.{key}' if prefix else str(key)
+                if re.search(r'(?:sub(?:title)?|caption|srt|vtt|\.ass$)', str(key), re.I):
+                    found.append(path)
+                YfspIE._subtitle_like_paths(item, path, found)
+        elif isinstance(value, list):
+            for index, item in enumerate(value[:20]):
+                YfspIE._subtitle_like_paths(item, f'{prefix}[{index}]', found)
+        return found
+
+    @staticmethod
+    def _hint_strings(text, limit=40):
+        """挑出文本里所有提到 subtitle/caption/srt/vtt 的片段（找隐藏的字幕接口用）。"""
+        found = []
+        if not text:
+            return found
+        pattern = re.compile(
+            r'''[^\s"'<>]{0,160}(?:sub(?:title)?|caption|\.srt|\.vtt)[^\s"'<>]{0,160}''',
+            re.I,
+        )
+        for match in pattern.finditer(text):
+            value = match.group(0).strip()
+            if len(value) < 4 or value in found:
+                continue
+            found.append(value)
+            if len(found) >= limit:
+                break
+        return found
+
+    def _player_probe(self, url, webpage, media_id, page_headers):
+        """播放接口里没有字幕时，翻页面和播放器脚本，找它另外调用的字幕接口。"""
+        probe = {
+            'script_urls': [],
+            'page_hits': self._hint_strings(webpage),
+            'script_hits': {},
+            'errors': [],
+        }
+        scripts = re.findall(r'<script[^>]+src=["\']([^"\']+)["\']', webpage or '', re.I)
+        absolute = []
+        for src in scripts:
+            full = urllib.parse.urljoin(url, src)
+            if full.startswith('http') and full not in absolute:
+                absolute.append(full)
+        probe['script_urls'] = absolute[:12]
+
+        for full in absolute[:6]:
+            try:
+                text = self._download_text(
+                    full,
+                    media_id,
+                    f'Probing player script {Path(full).name}',
+                    {**page_headers, 'Referer': url},
+                    impersonate='chrome',
+                )
+            except Exception as error:
+                probe['errors'].append(f'{full}: {error}')
+                continue
+            hits = self._hint_strings(text)
+            if hits:
+                probe['script_hits'][full] = hits
+        return probe
+
+    def _write_text(self, name, text):
+        try:
+            directory = Path.home() / (
+                'Library/Application Support/com.esun.video-commentary/debug')
+            directory.mkdir(parents=True, exist_ok=True)
+            (directory / name).write_text((text or '')[:1500000], encoding='utf-8')
+        except Exception:
+            pass
+
+    def _write_probe(self, payload):
+        """把播放接口的原始返回落盘，供「平台有没有字幕」这类问题定位。"""
+        try:
+            directory = Path.home() / (
+                'Library/Application Support/com.esun.video-commentary/debug')
+            directory.mkdir(parents=True, exist_ok=True)
+            (directory / 'yfsp-last.json').write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2, default=str)[:2000000],
+                encoding='utf-8',
+            )
+        except Exception:
+            # 诊断信息永远不能影响正常解析
+            pass
+
     def _real_extract(self, url):
         movie_id = self._match_id(url)
         episode_id = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query).get('id', [None])[0]
         media_id = episode_id or movie_id
-        user_agent = (
+        configured_user_agent = (
             (self._downloader.params.get('http_headers') or {}).get('User-Agent')
             or self._UA
         )
+        user_agent = self._chrome_session(url, media_id, configured_user_agent)
 
         page_headers = {
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
             'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
             'User-Agent': user_agent,
         }
-        webpage = self._download_text(url, media_id, 'Reading YFSP player configuration', page_headers)
+        webpage = self._download_text(
+            url,
+            media_id,
+            'Reading YFSP player configuration',
+            page_headers,
+            impersonate='chrome',
+        )
         page_title = self._clean_title(self._html_extract_title(webpage, default=None))
 
         public_key = self._search_regex(
@@ -211,7 +720,13 @@ class YfspIE(InfoExtractor):
             'User-Agent': user_agent,
             'X-Requested-With': 'XMLHttpRequest',
         }
-        api_text = self._download_text(api_url, media_id, 'Resolving YFSP full video', api_headers)
+        api_text = self._download_text(
+            api_url,
+            media_id,
+            'Resolving YFSP full video',
+            api_headers,
+            browser_fallback=True,
+        )
         try:
             response = json.loads(api_text)
         except json.JSONDecodeError as error:
@@ -261,7 +776,32 @@ class YfspIE(InfoExtractor):
                 expected=True,
             )
 
-        title = self._metadata_title(info, response) or page_title or media_id
+        title = (
+            self._metadata_title(info, response, reject=self._quality_labels(info))
+            or page_title
+            or media_id
+        )
+        player_probe = {}
+        if not subtitles:
+            # 平台接口没给字幕时，再翻一层播放器脚本，看是否有独立的字幕接口。
+            try:
+                player_probe = self._player_probe(url, webpage, media_id, page_headers)
+                self._write_text('yfsp-page.html', webpage)
+            except Exception as error:
+                player_probe = {'fatal': str(error)}
+        self._write_probe({
+            'url': url,
+            'fetched_at': time.strftime('%Y-%m-%d %H:%M:%S'),
+            'api_url': api_url,
+            'api_code': (response.get('data') or {}).get('code'),
+            'page_title': page_title,
+            'resolved_title': title,
+            'api_response': response,
+            'info_keys': sorted(info.keys()) if isinstance(info, dict) else None,
+            'subtitle_like_paths': self._subtitle_like_paths(response),
+            'computed_subtitles': subtitles,
+            'player_probe': player_probe,
+        })
         return {
             'id': media_id,
             'display_id': movie_id,

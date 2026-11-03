@@ -16,31 +16,12 @@ pub enum FfmpegError {
     Io(#[from] std::io::Error),
 }
 
-const LOCAL_SRT: &str = "commentary-burn.srt";
 const RENDER_AUDIO_RATE: &str = "48000";
 const RENDER_AUDIO_CHANNELS: &str = "2";
 
 #[cfg(test)]
 mod resolver_tests {
     use super::*;
-
-    #[test]
-    fn native_timing_never_extends_picture_or_cuts_voice() {
-        assert_eq!(native_clip_duration(12.0, 8.0, false).unwrap(), 8.0);
-        assert_eq!(native_clip_duration(12.0, 8.0, true).unwrap(), 12.0);
-        assert_eq!(native_clip_duration(8.0, 8.0, false).unwrap(), 8.0);
-        for original in [false, true] {
-            for (src, audio) in [
-                (4.0, 12.0),
-                (8.0, 8.01),
-                (0.4, 0.3),
-                (f64::NAN, 3.0),
-                (3.0, f64::INFINITY),
-            ] {
-                assert!(native_clip_duration(src, audio, original).is_err());
-            }
-        }
-    }
 
     #[test]
     fn skips_existing_but_unusable_preferred_installation() {
@@ -203,24 +184,6 @@ fn run_cmd(cmd: &mut Command) -> Result<(), FfmpegError> {
         return Err(FfmpegError::Failed(stderr.to_string()));
     }
     Ok(())
-}
-
-pub fn extract_review_frame(video: &Path, second: f64, output: &Path) -> Result<(), FfmpegError> {
-    let ffmpeg = resolve_ffmpeg_bin().ok_or(FfmpegError::NotFound)?;
-    run_cmd(Command::new(&ffmpeg).args([
-        "-y",
-        "-ss",
-        &format!("{second:.3}"),
-        "-i",
-        video.to_str().unwrap_or_default(),
-        "-frames:v",
-        "1",
-        "-vf",
-        "scale=960:-2",
-        "-q:v",
-        "4",
-        output.to_str().unwrap_or_default(),
-    ]))
 }
 
 pub fn subtitles_filter_hint() -> String {
@@ -441,6 +404,26 @@ pub fn extract_best_embedded_subtitle(
     }
 }
 
+pub fn has_audio(media_path: &Path) -> bool {
+    let Some(ffprobe) = resolve_ffprobe() else {
+        return false;
+    };
+    Command::new(ffprobe)
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "a:0",
+            "-show_entries",
+            "stream=index",
+            "-of",
+            "csv=p=0",
+        ])
+        .arg(media_path)
+        .output()
+        .is_ok_and(|output| output.status.success() && !output.stdout.trim_ascii().is_empty())
+}
+
 /// Every cached paragraph clip must satisfy one audio contract before concat.
 /// The concat demuxer does not reject mixed AAC sample rates; it can instead
 /// produce a successful file with long silent holes at a format boundary.
@@ -481,162 +464,6 @@ pub fn has_render_audio_contract(media_path: &Path) -> bool {
         && render_audio_contract_matches(&String::from_utf8_lossy(&output.stdout))
 }
 
-/// Cut at native speed. Insufficient coverage must be repaired in the edit, not frozen.
-/// Famous-scene clips (`keep_original_audio`) play at native speed and keep original sound.
-fn native_clip_duration(src: f64, audio: f64, keep_original: bool) -> Result<f64, FfmpegError> {
-    if !src.is_finite() || !audio.is_finite() || src < 0.8 || audio <= 0.0 {
-        return Err(FfmpegError::Failed(
-            "镜头或配音时长无效，镜头至少需要 0.8 秒".into(),
-        ));
-    }
-    if audio > src {
-        return Err(FfmpegError::Failed(format!(
-            "配音需要 {audio:.2} 秒，但所选画面只有 {src:.2} 秒。请调整本段选片或文案后重新成片；不会使用定格、慢放或截断声音补足时长"
-        )));
-    }
-    if keep_original && src - audio < 4.0 {
-        return Err(FfmpegError::Failed(
-            "原声接力需要在解说结束后至少留出 4 秒完整对白，请调整引导文案和原声选片".into(),
-        ));
-    }
-    Ok(if keep_original { src } else { audio })
-}
-
-pub fn fit_clip_to_narration(
-    source: &Path,
-    start_secs: f64,
-    end_secs: f64,
-    audio_path: &Path,
-    output_path: &Path,
-    orig_volume: f64,
-    keep_original_audio: bool,
-    frame_w: u32,
-    frame_h: u32,
-    original_start_secs: Option<f64>,
-) -> Result<f64, FfmpegError> {
-    let ffmpeg = resolve_ffmpeg_bin().ok_or(FfmpegError::NotFound)?;
-    let audio_dur = get_duration(audio_path)?;
-    let src_dur = end_secs - start_secs;
-    let clip_dur = native_clip_duration(src_dur, audio_dur, keep_original_audio)?;
-
-    let scale = format!(
-        "scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,format=yuv420p",
-        w = frame_w,
-        h = frame_h
-    );
-    let vf = format!(
-        "setpts=PTS-STARTPTS,trim=duration={clip_dur:.6},setpts=PTS-STARTPTS,fps=30,setsar=1,{scale}"
-    );
-
-    let mix_original = keep_original_audio || orig_volume > 0.001;
-    let volume = if keep_original_audio {
-        orig_volume.max(0.85)
-    } else {
-        orig_volume
-    };
-    let mix_weights = "1 1";
-    let original_gain = if keep_original_audio {
-        let handoff = original_start_secs
-            .ok_or_else(|| FfmpegError::Failed("原声接力缺少字幕对白边界".into()))?
-            - start_secs;
-        if handoff < audio_dur || src_dur - handoff < 4.0 {
-            return Err(FfmpegError::Failed(
-                "原声对白边界无法容纳引导配音及完整原声".into(),
-            ));
-        }
-        format!("volume=0:enable='lt(t,{handoff:.6})',volume={volume}")
-    } else {
-        format!("volume={volume}")
-    };
-
-    let start = format!("{start_secs:.3}");
-    let dur = format!("{src_dur:.3}");
-    let t = format!("{clip_dur:.3}");
-
-    let mut args: Vec<String> = vec![
-        "-y".into(),
-        "-ss".into(),
-        start,
-        "-t".into(),
-        dur,
-        "-i".into(),
-        source.to_string_lossy().into_owned(),
-        "-i".into(),
-        audio_path.to_string_lossy().into_owned(),
-    ];
-
-    if mix_original {
-        let filter = format!(
-            "[0:v]{vf}[v];\
-             [1:a]aresample={RENDER_AUDIO_RATE}:async=0:first_pts=0,aformat=sample_fmts=fltp:channel_layouts=stereo,apad=whole_dur={clip_dur:.3},atrim=0:{clip_dur:.3},asetpts=PTS-STARTPTS[tts];\
-             [0:a]asetpts=PTS-STARTPTS,aresample={RENDER_AUDIO_RATE}:async=0:first_pts=0,aformat=sample_fmts=fltp:channel_layouts=stereo,{original_gain},apad=whole_dur={clip_dur:.3},atrim=0:{clip_dur:.3}[orig];\
-             [tts][orig]amix=inputs=2:duration=first:dropout_transition=0:weights={mix_weights}:normalize=0,loudnorm=I=-16:TP=-1.5:LRA=11,aresample={RENDER_AUDIO_RATE}:async=0:first_pts=0[a]"
-        );
-        args.extend([
-            "-filter_complex".into(),
-            filter,
-            "-map".into(),
-            "[v]".into(),
-            "-map".into(),
-            "[a]".into(),
-        ]);
-    } else {
-        let filter = format!(
-            "[0:v]{vf}[v];[1:a]aresample={RENDER_AUDIO_RATE}:async=0:first_pts=0,aformat=sample_fmts=fltp:channel_layouts=stereo,apad=whole_dur={clip_dur:.3},atrim=0:{clip_dur:.3}[a]"
-        );
-        args.extend([
-            "-filter_complex".into(),
-            filter,
-            "-map".into(),
-            "[v]".into(),
-            "-map".into(),
-            "[a]".into(),
-        ]);
-    }
-
-    args.extend([
-        "-t".into(),
-        t,
-        "-c:v".into(),
-        "libx264".into(),
-        "-preset".into(),
-        "fast".into(),
-        "-crf".into(),
-        "20".into(),
-        "-c:a".into(),
-        "aac".into(),
-        "-b:a".into(),
-        "192k".into(),
-        "-ar".into(),
-        RENDER_AUDIO_RATE.into(),
-        "-ac".into(),
-        RENDER_AUDIO_CHANNELS.into(),
-        "-pix_fmt".into(),
-        "yuv420p".into(),
-        "-movflags".into(),
-        "+faststart".into(),
-        output_path.to_string_lossy().into_owned(),
-    ]);
-
-    let result = run_cmd(Command::new(&ffmpeg).args(&args));
-    if result.is_err() && mix_original && !keep_original_audio {
-        return fit_clip_to_narration(
-            source,
-            start_secs,
-            end_secs,
-            audio_path,
-            output_path,
-            0.0,
-            false,
-            frame_w,
-            frame_h,
-            None,
-        );
-    }
-    result?;
-    Ok(clip_dur)
-}
-
 /// A paragraph spans multiple native-speed pictures. In duck mode, their source
 /// ambience is concatenated and side-chain compressed under narration.
 pub fn narration_montage(
@@ -651,7 +478,7 @@ pub fn narration_montage(
 ) -> Result<(), FfmpegError> {
     let ffmpeg = resolve_ffmpeg_bin().ok_or(FfmpegError::NotFound)?;
     if ranges.is_empty() {
-        return Err(FfmpegError::Failed("样片没有画面".into()));
+        return Err(FfmpegError::Failed("段落没有画面".into()));
     }
     let mut args = vec!["-y".to_string()];
     let mut filter = String::new();
@@ -702,8 +529,9 @@ pub fn narration_montage(
         "libx264".into(),
         "-preset".into(),
         "fast".into(),
+        // Intermediate generation: the vertical compose re-encodes once more.
         "-crf".into(),
-        "20".into(),
+        "16".into(),
         "-c:a".into(),
         "aac".into(),
         "-b:a".into(),
@@ -844,7 +672,7 @@ pub fn mix_background_music(
     }
     let duration = get_duration(video_path)?;
     if !duration.is_finite() || duration <= 0.0 {
-        return Err(FfmpegError::Failed("无法读取粗剪时长".into()));
+        return Err(FfmpegError::Failed("无法读取视频时长".into()));
     }
     let gain = 10f64.powf(music_db / 20.0);
     let filter = format!(
@@ -887,67 +715,81 @@ pub fn mix_background_music(
     ]))
 }
 
-fn commentary_caption_filter(font_size: u32, mask_percent: u32) -> String {
-    let margin_v = font_size.saturating_div(2).max(10);
-    let mask = mask_percent.min(40);
-    let cover = if mask == 0 {
-        String::new()
-    } else {
-        format!("drawbox=x=0:y=ih*(1-{mask}/100):w=iw:h=ih*{mask}/100:color=black:t=fill,")
-    };
-    format!("{cover}subtitles=filename={LOCAL_SRT}:force_style='FontSize={font_size},PrimaryColour=&HFFFFFF,OutlineColour=&H000000,Outline=2,Alignment=2,MarginV={margin_v}'")
+pub const VERTICAL_W: u32 = 1080;
+pub const VERTICAL_H: u32 = 1920;
+const LOCAL_ASS: &str = "short-captions.ass";
+
+/// Height the source picture occupies inside the 9:16 canvas after the bottom
+/// `mask_percent` (burned-in source subtitles) is cropped away.
+pub fn vertical_foreground_height(src_w: u32, src_h: u32, mask_percent: u32) -> u32 {
+    let kept = src_h as f64 * (1.0 - mask_percent.min(40) as f64 / 100.0);
+    let scale = (VERTICAL_W as f64 / src_w.max(1) as f64).min(VERTICAL_H as f64 / kept.max(1.0));
+    ((kept * scale / 2.0).round() as u32 * 2).min(VERTICAL_H)
 }
 
-pub fn burn_subtitles(
+fn vertical_filter(mask_percent: u32) -> String {
+    let mask = mask_percent.min(40);
+    let crop = if mask == 0 {
+        String::new()
+    } else {
+        format!("crop=iw:trunc(ih*(100-{mask})/200)*2:0:0,")
+    };
+    format!(
+        "[0:v]split=2[bgsrc][fgsrc];\
+         [bgsrc]scale={VERTICAL_W}:{VERTICAL_H}:force_original_aspect_ratio=increase,crop={VERTICAL_W}:{VERTICAL_H},boxblur=24:2,eq=brightness=-0.22[bg];\
+         [fgsrc]{crop}scale={VERTICAL_W}:{VERTICAL_H}:force_original_aspect_ratio=decrease:force_divisible_by=2,setsar=1[fg];\
+         [bg][fg]overlay=(W-w)/2:(H-h)/2,subtitles=filename={LOCAL_ASS},format=yuv420p[v]"
+    )
+}
+
+/// Recompose a landscape (or any) montage into a 9:16 short: blurred fill,
+/// centered picture, and an ASS layer carrying the title and narration captions.
+pub fn compose_vertical(
     video_path: &Path,
-    subtitle_path: &Path,
+    ass_path: &Path,
     output_path: &Path,
-    font_size: u32,
     mask_percent: u32,
 ) -> Result<(), FfmpegError> {
     let ffmpeg = resolve_ffmpeg().ok_or_else(|| FfmpegError::Failed(subtitles_filter_hint()))?;
-
     if video_path == output_path {
         return Err(FfmpegError::Failed(
             "Input and output video paths must differ".into(),
         ));
     }
-
     let output_dir = output_path
         .parent()
         .ok_or_else(|| FfmpegError::Failed("Output path has no parent directory".into()))?;
     fs::create_dir_all(output_dir)?;
-
-    let local_srt = output_dir.join(LOCAL_SRT);
-    fs::copy(subtitle_path, &local_srt)?;
-
+    let local_ass = output_dir.join(LOCAL_ASS);
+    if fs::canonicalize(ass_path).ok() != fs::canonicalize(&local_ass).ok() {
+        fs::copy(ass_path, &local_ass)?;
+    }
     let video_input = fs::canonicalize(video_path).unwrap_or_else(|_| video_path.to_path_buf());
-    let vf = commentary_caption_filter(font_size, mask_percent);
-    let pending_output = output_path.with_extension("captions-pending.mp4");
-
+    let pending_output = output_path.with_extension("vertical-pending.mp4");
     let result = run_cmd(Command::new(&ffmpeg).current_dir(output_dir).args([
         "-y",
         "-i",
         video_input.to_str().unwrap_or_default(),
+        "-filter_complex",
+        &vertical_filter(mask_percent),
         "-map",
-        "0:v:0",
+        "[v]",
         "-map",
-        "0:a?",
-        "-sn",
-        "-vf",
-        &vf,
+        "0:a",
         "-c:v",
         "libx264",
         "-preset",
-        "fast",
+        "medium",
         "-crf",
         "18",
+        "-profile:v",
+        "high",
         "-c:a",
         "copy",
+        "-movflags",
+        "+faststart",
         pending_output.to_str().unwrap_or_default(),
     ]));
-
-    let _ = fs::remove_file(&local_srt);
     if let Err(error) = result {
         let _ = fs::remove_file(&pending_output);
         return Err(error);
@@ -956,15 +798,82 @@ pub fn burn_subtitles(
     Ok(())
 }
 
+fn landscape_filter(mask_percent: u32) -> String {
+    let mask = mask_percent.min(40);
+    format!("crop=iw:trunc(ih*(100-{mask})/200)*2:0:0,scale=1920:1080:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1,subtitles=filename={LOCAL_ASS},format=yuv420p")
+}
+
+/// Fixed 16:9 delivery. Crop the old subtitle strip, fit/pad without stretching.
+pub fn compose_landscape(
+    video_path: &Path,
+    ass_path: &Path,
+    output_path: &Path,
+    mask_percent: u32,
+) -> Result<(), FfmpegError> {
+    let ffmpeg = resolve_ffmpeg().ok_or_else(|| FfmpegError::Failed(subtitles_filter_hint()))?;
+    let output_dir = output_path
+        .parent()
+        .ok_or_else(|| FfmpegError::Failed("Output path has no parent".into()))?;
+    fs::create_dir_all(output_dir)?;
+    let local_ass = output_dir.join(LOCAL_ASS);
+    fs::copy(ass_path, &local_ass)?;
+    let input = fs::canonicalize(video_path)?;
+    let output = output_dir.join("landscape-pending.mp4");
+    let filter = landscape_filter(mask_percent);
+    let result = run_cmd(Command::new(ffmpeg).current_dir(output_dir).args([
+        "-y",
+        "-i",
+        input.to_str().unwrap_or_default(),
+        "-vf",
+        &filter,
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a:0",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "medium",
+        "-crf",
+        "18",
+        "-c:a",
+        "copy",
+        "-movflags",
+        "+faststart",
+        output.to_str().unwrap_or_default(),
+    ]));
+    if let Err(error) = result {
+        let _ = fs::remove_file(output);
+        return Err(error);
+    }
+    fs::rename(output, output_path)?;
+    Ok(())
+}
+
 #[cfg(test)]
-mod commentary_caption_tests {
+mod vertical_tests {
     use super::*;
     #[test]
-    fn covers_source_before_drawing_commentary() {
-        let filter = commentary_caption_filter(24, 18);
-        assert!(filter.starts_with("drawbox="));
-        assert!(filter.contains("h=ih*18/100:color=black:t=fill,subtitles="));
-        assert!(!commentary_caption_filter(24, 0).contains("drawbox"));
-        assert!(commentary_caption_filter(24, 100).contains("h=ih*40/100"));
+    fn episode_output_fits_landscape_without_stretch_or_slow_motion() {
+        let filter = landscape_filter(18);
+        assert!(filter.contains("scale=1920:1080:force_original_aspect_ratio=decrease"));
+        assert!(filter.contains("pad=1920:1080"));
+        assert!(filter.contains("100-18"));
+        assert!(landscape_filter(90).contains("100-40"));
+        assert!(!filter.contains("boxblur"));
+        assert!(!filter.contains("setpts"));
+    }
+
+    #[test]
+    fn landscape_source_sits_in_the_middle_band() {
+        assert_eq!(vertical_foreground_height(1920, 1080, 0), 608);
+        assert!(vertical_foreground_height(1920, 1080, 18) < 608);
+        assert_eq!(vertical_foreground_height(1080, 1920, 0), 1920);
+    }
+    #[test]
+    fn mask_crops_instead_of_drawing_a_bar() {
+        assert!(vertical_filter(18).contains("crop=iw:trunc(ih*(100-18)/200)*2:0:0,"));
+        assert!(!vertical_filter(0).contains("crop=iw:"));
+        assert!(vertical_filter(90).contains("100-40"));
     }
 }

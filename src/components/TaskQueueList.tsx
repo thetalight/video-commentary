@@ -15,26 +15,16 @@ interface TaskQueueListProps {
 
 const STEP_LABELS: Record<string, string> = {
   download: "下载视频",
-  download_subtitle: "拉取字幕",
-  transcribe: "字幕获取",
-  director: "AI 导演",
-  tts: "配音",
-  render: "剪辑拼接",
-  burn: "烧录字幕",
+  download_subtitle: "获取字幕",
+  transcribe: "获取字幕",
 };
 
 const STATUS_LABELS: Record<QueueTaskStatus, string> = {
   queued: "排队中",
-  running: "进行中",
-  awaiting_director: "AI 待重试",
-  ready: "待审稿",
-  completed: "已成片",
+  running: "准备素材",
+  ready: "素材就绪",
+  completed: "已出片",
   failed: "失败",
-};
-
-const KIND_LABELS: Record<string, string> = {
-  prepare: "下载字幕",
-  render: "生成成片",
 };
 
 export function TaskQueueList({
@@ -108,9 +98,6 @@ export function TaskQueueList({
                 <span className={`task-status-badge badge-${task.status}`}>
                   {STATUS_LABELS[task.status]}
                 </span>
-                <span className="task-kind-badge">
-                  {KIND_LABELS[task.kind] ?? task.kind}
-                </span>
                 {task.restored && <span className="task-history-badge">历史</span>}
                 <strong className="online-task-label">{task.label}</strong>
               </button>
@@ -162,10 +149,6 @@ export function TaskQueueList({
               </div>
             </div>
 
-            {task.status === "awaiting_director" && (
-              <p className="progress-message">检查本机 Ollama 服务和模型后重试</p>
-            )}
-
             {task.status === "running" && (
               <div className="online-task-progress">
                 {task.progress ? (
@@ -200,12 +183,12 @@ export function TaskQueueList({
 
             {pendingDeleteId === task.id && (
               <p className="task-delete-warning">
-                将永久删除原视频、字幕、导演稿、配音片段和成片，无法恢复。
+                将永久删除原视频、字幕、整集稿件、配音、整集成片与旧短片产物，无法恢复。
               </p>
             )}
 
-            {task.outputPath && task.status === "completed" && (
-              <p className="file-path">{task.outputPath}</p>
+            {task.status === "completed" && (
+              <p className="progress-message">整集横屏视频已生成 · 待人工验收</p>
             )}
           </li>
         ))}

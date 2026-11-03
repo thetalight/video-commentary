@@ -1,26 +1,29 @@
 import { useEffect, useState } from "react";
 import {
   checkDependencies,
-  checkOllama,
+  checkAi,
   getSettings,
+  listLocalVoices,
   saveSettings,
 } from "../lib/api";
-import type { AppConfig, DependencyStatus, OllamaStatus } from "../lib/types";
+import type { AiStatus, AppConfig, DependencyStatus, LocalVoice } from "../lib/types";
 import { STYLE_OPTIONS } from "../lib/types";
-import { EdgeVoiceSelector } from "./EdgeVoiceSelector";
+import { LocalVoiceSelector } from "./LocalVoiceSelector";
 
 export function Settings() {
   const [config, setConfig] = useState<AppConfig | null>(null);
   const [deps, setDeps] = useState<DependencyStatus | null>(null);
+  const [voices, setVoices] = useState<LocalVoice[]>([]);
   const [saved, setSaved] = useState(false);
   const [open, setOpen] = useState(false);
-  const [ollama, setOllama] = useState<OllamaStatus | null>(null);
-  const [checkingOllama, setCheckingOllama] = useState(false);
+  const [ai, setAi] = useState<AiStatus | null>(null);
+  const [checkingAi, setCheckingAi] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
 
   useEffect(() => {
     getSettings().then(setConfig);
     checkDependencies().then(setDeps);
+    listLocalVoices().then(setVoices);
   }, []);
 
   if (!config) return null;
@@ -30,8 +33,7 @@ export function Settings() {
     (!deps.ytdlp ||
       !deps.ffmpeg ||
       !deps.ffmpeg_burn ||
-      !deps.edge_tts ||
-      !deps.hard_subtitle_ocr);
+      !deps.local_tts);
 
   async function handleSave() {
     if (!config) return;
@@ -47,13 +49,14 @@ export function Settings() {
     }
   }
 
-  async function handleCheckOllama() {
-    if (!config) return;
-    setCheckingOllama(true);
+  async function handleCheckAi() {
+    setCheckingAi(true);
     try {
-      setOllama(await checkOllama(config.ollama_base_url));
+      setAi(await checkAi());
+    } catch {
+      setAi({ available: false, model: "", error: "无法检测 AI 配置，请重试" });
     } finally {
-      setCheckingOllama(false);
+      setCheckingAi(false);
     }
   }
 
@@ -92,12 +95,9 @@ export function Settings() {
                     请更新或重装以修复依赖；应用会自动检测，无需强制覆盖系统链接。
                   </li>
                 )}
-                {!deps!.hard_subtitle_ocr && (
-                  <li>未找到本地画面字幕 OCR 组件，请重新构建或安装完整应用。</li>
-                )}
-                {!deps!.edge_tts && (
+                {!deps!.local_tts && (
                   <li>
-                    配音：<code>pip install edge-tts</code>
+                    本机没有可用的 macOS 中文音色；请在系统设置中安装中文语音。
                   </li>
                 )}
               </ul>
@@ -107,31 +107,34 @@ export function Settings() {
           {deps?.ytdlp && deps.ffmpeg && (
             <div className="deps-ok">
               yt-dlp、ffmpeg 已就绪
-              {deps.hard_subtitle_ocr ? "，本地画面字幕 OCR 已就绪" : "，画面字幕 OCR 未检测到"}
-              {deps.edge_tts ? "，edge-tts 已就绪" : "，将尝试系统 say 兜底"}
+              {deps.local_tts ? "，本机中文配音已就绪" : "；缺少本机中文音色，无法出片"}
             </div>
           )}
 
-          <div className={`ollama-status ${ollama?.available ? "online" : "offline"}`}>
+          <div className={`ai-status ${ai?.available ? "online" : "offline"}`}>
               <div>
-                <strong>本地 Ollama</strong>
+                <strong>DeepSeek API</strong>
                 <p>
-                  {ollama
-                    ? ollama.available
-                      ? `已连接 · ${ollama.models.length} 个模型`
-                      : ollama.error ?? "未连接"
-                    : "点击检测本地导演服务"}
+                  {ai
+                    ? ai.available
+                      ? `已连接 · ${ai.model}`
+                      : ai.error ?? "未连接"
+                    : "通过后端 .env 配置；点击检测模型访问权限"}
                 </p>
               </div>
-              <button type="button" onClick={handleCheckOllama} disabled={checkingOllama}>
-                {checkingOllama ? "检测中..." : "检测连接"}
+              <button type="button" onClick={handleCheckAi} disabled={checkingAi}>
+                {checkingAi ? "检测中..." : "检测连接"}
               </button>
+          </div>
+          <div className="warning">
+            AI 梳理、写稿和评审会将原语言字幕及文案文本发送到 .env 配置的 API；
+            自定义地址时，请确认该服务可信。配置TAVILY_API_KEY后，AI修稿可向Tavily发送少量关键词（人名/片名等可能外发），结果摘要再发送给DeepSeek；每轮工作流最多3次搜索，不发送整份字幕给搜索服务。原片画面、音轨不作为 AI 输入，转写和配音仍在本机完成。
           </div>
 
           <div className="settings-grid">
-            <label>AI 运行方式<input value="本机 Ollama（不上传字幕、脚本或画面）" disabled /></label>
+            <label>AI 运行方式<input value="DeepSeek API（后端 .env 配置）" disabled /></label>
 
-            <EdgeVoiceSelector voice={config.tts_voice} onChange={voice => setConfig({ ...config, tts_voice: voice })} />
+            <LocalVoiceSelector voice={config.tts_voice} voices={voices} onChange={voice => setConfig({ ...config, tts_voice: voice })} />
 
             <label className="span-2">本地背景音乐（可选，留空不添加）
               <input
@@ -142,7 +145,7 @@ export function Settings() {
                   setConfig({ ...config, background_music_path: event.target.value })
                 }
               />
-              <small>仅读取本机文件；音乐会循环铺底，并在解说或原声出现时自动压低。</small>
+              <small>仅读取本机文件；音乐循环铺底，解说出现时自动压低。</small>
             </label>
             <label>背景音乐音量
               <input
@@ -173,61 +176,26 @@ export function Settings() {
               </select>
             </label>
 
-              <>
-                <label>
-                  Ollama 模型
-                  <input
-                    type="text"
-                    list="ollama-models"
-                    value={config.ollama_model}
-                    placeholder="留空自动选择，推荐 qwen3:8b"
-                    onChange={(e) =>
-                      setConfig({ ...config, ollama_model: e.target.value })
-                    }
-                  />
-                  <datalist id="ollama-models">
-                    {ollama?.models.map((model) => (
-                      <option key={model} value={model} />
-                    ))}
-                  </datalist>
-                </label>
-
-                <label>
-                  Ollama API
-                  <input
-                    type="text"
-                    value={config.ollama_base_url}
-                    onChange={(e) =>
-                      setConfig({ ...config, ollama_base_url: e.target.value })
-                    }
-                  />
-                </label>
-
-                <label>
-                  粗剪视觉评审模型
-                  <input
-                    type="text"
-                    list="ollama-models"
-                    value={config.ollama_vision_model}
-                    placeholder="留空自动选择本机视觉模型"
-                    onChange={(event) =>
-                      setConfig({ ...config, ollama_vision_model: event.target.value })
-                    }
-                  />
-                  <small>仅把粗剪抽帧发送到本机 Ollama；不会使用云模型。</small>
-                </label>
-              </>
+            <label className="span-2">
+              AI 配置说明
+              <small>
+                在后端 .env 设置 DEEPSEEK_API_KEY、DEEPSEEK_BASE_URL、DEEPSEEK_MODEL。
+                默认模型ID为 deepseek-flash（官方接口已验证），模型名原样发送；API Key 不会传到此界面或保存在任务中。
+                可选TAVILY_API_KEY用于AI修稿时联网查证；留空则只据字幕修稿。搜索结果仅供辅助，不是剧情证据，Key同样不进入前端或任务。
+                修改文件后下次请求生效，进程环境变量优先；检测连接只读取DeepSeek模型列表，不检测搜索服务、不运行生成。
+              </small>
+            </label>
 
             <label>
-              原声
+              原片声音
               <select
                 value={config.original_audio_mode}
                 onChange={(e) =>
                   setConfig({ ...config, original_audio_mode: e.target.value })
                 }
               >
-                <option value="mute">静音</option>
-                <option value="duck">压低（-20 dB）</option>
+                <option value="duck">压低铺底（默认，解说时再自动避让）</option>
+                <option value="mute">静音（只留解说）</option>
               </select>
             </label>
 
@@ -260,30 +228,15 @@ export function Settings() {
               </select>
             </label>
 
-            <label>
-              原画面字幕遮盖高度
-              <select value={config.source_caption_mask_percent ?? 18} onChange={e => {
-                const percent = Number(e.target.value);
-                setConfig({ ...config, source_caption_mask_percent: percent, burn_captions: percent > 0 || config.burn_captions });
-              }}>
-                <option value={0}>不遮盖（原片没有硬字幕）</option>
+            <label className="span-2">
+              裁掉原片底部（隐藏原片硬字幕）
+              <select value={config.source_caption_mask_percent ?? 18} onChange={e =>
+                setConfig({ ...config, source_caption_mask_percent: Number(e.target.value) })
+              }>
+                <option value={0}>不裁（原片没有硬字幕）</option>
                 {[10,15,18,20,25,30,40].map(n => <option key={n} value={n}>底部 {n}%{n === 18 ? "（默认）" : ""}</option>)}
               </select>
-              <small>先用黑色字幕区遮住底部原字幕，再显示解说字幕。会遮挡对应画面；位置较高的原字幕需调大高度。原视频不变。</small>
-            </label>
-
-            <label>
-              烧录解说字幕
-              <select
-                value={config.burn_captions || (config.source_caption_mask_percent ?? 18) > 0 ? "yes" : "no"}
-                disabled={(config.source_caption_mask_percent ?? 18) > 0}
-                onChange={(e) =>
-                  setConfig({ ...config, burn_captions: e.target.value === "yes" })
-                }
-              >
-                <option value="yes">开启</option>
-                <option value="no">关闭</option>
-              </select>
+              <small>横屏合成时裁掉原画面底部这一条，再等比缩放并补边到16:9，避免硬字幕与解说字幕叠加。若原片没有硬字幕请选择不裁，原视频文件不变。</small>
             </label>
 
             <label>
@@ -312,14 +265,30 @@ export function Settings() {
               </select>
             </label>
 
-            <label className="span-2">
-              字幕获取策略
-              <input value="平台字幕 → 视频内封字幕 → 本地画面硬字幕 OCR" disabled />
-              <small>不使用语音识别；三种字幕都不可用时任务会停止。</small>
+            <label>
+              没有字幕时用本机语音转写
+              <select
+                value={config.asr_fallback ? "yes" : "no"}
+                onChange={(e) =>
+                  setConfig({ ...config, asr_fallback: e.target.value === "yes" })
+                }
+              >
+                <option value="yes">开启（默认）</option>
+                <option value="no">关闭（没有字幕就放弃）</option>
+              </select>
+              <small>
+                平台独立字幕和视频内封字幕都没有时，用本机 whisper 从音轨生成带时间戳的逐字稿，全程不联网。关闭后这类视频会直接放弃。
+              </small>
             </label>
 
             <label className="span-2">
-              任务目录（固定在源码 inbox）
+              字幕获取策略
+              <input value="平台字幕 → 视频内封字幕 → 本机语音转写（可关闭）" disabled />
+              <small>不做画面 OCR，不全文翻译字幕；保留原语言与时间戳，DeepSeek 直接理解原文并写中文解说，证据引文保留原语言。</small>
+            </label>
+
+            <label className="span-2">
+              任务目录
               <div className="dir-row">
                 <input type="text" value={config.output_dir} readOnly />
               </div>

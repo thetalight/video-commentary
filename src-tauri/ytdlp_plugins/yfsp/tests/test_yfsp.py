@@ -87,5 +87,60 @@ class SelectSourcesTests(unittest.TestCase):
         )
 
 
+class ProbeTests(unittest.TestCase):
+    def test_clarity_labels_are_not_mistaken_for_the_movie_title(self):
+        info = {
+            'playingMedia': {'key': 'k', 'title': '576'},
+            'clarity': [
+                {'title': '1080', 'description': '蓝光'},
+                {'title': '576', 'description': '标清'},
+            ],
+        }
+
+        reject = MODULE.YfspIE._quality_labels(info)
+
+        self.assertIn('576', reject)
+        self.assertIn('蓝光', reject)
+        # 没有片名字段时宁可用页面标题，也不能把画质标签当片名
+        self.assertIsNone(MODULE.YfspIE._metadata_title(info, reject=reject))
+
+    def test_subtitle_like_paths_finds_caption_fields_anywhere_in_the_response(self):
+        response = {
+            'data': {
+                'info': {
+                    'movieName': 'x',
+                    'subtitlePath': 'https://cdn.example/a.srt',
+                    'clarity': [{'memo': '1080p', 'caption': 'https://cdn.example/b.vtt'}],
+                },
+            },
+        }
+
+        self.assertEqual(
+            MODULE.YfspIE._subtitle_like_paths(response),
+            ['data.info.subtitlePath', 'data.info.clarity[0].caption'],
+        )
+
+    def test_subtitle_like_paths_is_empty_when_the_api_has_none(self):
+        self.assertEqual(
+            MODULE.YfspIE._subtitle_like_paths({'data': {'info': {'movieName': 'x'}}}),
+            [],
+        )
+
+
+    def test_hint_strings_find_hidden_subtitle_endpoints_in_player_scripts(self):
+        script = '''
+        var cfg = { subtitleApi: "/v3/subtitle/list?key=" + key };
+        fetch('/api/v3/video/captionList');
+        player.loadSub("https://cdn.example/sub/abc.srt");
+        var nothing = "/v3/video/play";
+        '''
+
+        hits = MODULE.YfspIE._hint_strings(script)
+
+        self.assertTrue(any('subtitle' in hit for hit in hits), hits)
+        self.assertTrue(any('captionList' in hit for hit in hits), hits)
+        self.assertTrue(any(hit.endswith('abc.srt') for hit in hits), hits)
+
+
 if __name__ == '__main__':
     unittest.main()

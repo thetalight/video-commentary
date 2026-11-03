@@ -11,7 +11,17 @@ pub fn repo_root() -> PathBuf {
 }
 
 pub fn inbox_root() -> PathBuf {
-    repo_root().join("inbox")
+    inbox_root_for(&repo_root(), dirs::data_local_dir())
+}
+
+fn inbox_root_for(repo: &Path, data_dir: Option<PathBuf>) -> PathBuf {
+    if repo.join("src-tauri/Cargo.toml").is_file() {
+        return repo.join("inbox");
+    }
+    data_dir
+        .or_else(|| dirs::home_dir().map(|home| home.join("Library/Application Support")))
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("com.esun.video-commentary/inbox")
 }
 
 #[derive(Debug, Clone)]
@@ -19,20 +29,8 @@ pub struct JobPaths {
     pub root: PathBuf,
     pub source: PathBuf,
     pub transcript: PathBuf,
-    pub brief: PathBuf,
     pub meta: PathBuf,
-    pub edit: PathBuf,
-    pub commentary: PathBuf,
-    pub compact: PathBuf,
-    pub normalized_transcript: PathBuf,
-    pub tts_dir: PathBuf,
-    pub clips_dir: PathBuf,
-    pub director_dir: PathBuf,
-    pub review_dir: PathBuf,
-    pub renders_dir: PathBuf,
-    pub render_manifest: PathBuf,
-    pub output: PathBuf,
-    pub output_srt: PathBuf,
+    pub shorts: PathBuf,
 }
 
 impl JobPaths {
@@ -40,36 +38,17 @@ impl JobPaths {
     /// and restored tasks have exactly one canonical directory under inbox.
     pub fn new(_output_dir: impl AsRef<Path>, task_id: &str) -> Self {
         let root = inbox_root().join(task_id);
-        let brief = root.clone();
         Self {
             source: root.join("source.mp4"),
             transcript: root.join("TRANSCRIPT.srt"),
-            meta: brief.join("META.json"),
-            edit: brief.join("edit.json"),
-            commentary: brief.join("commentary.md"),
-            compact: brief.join("TRANSCRIPT.compact.txt"),
-            normalized_transcript: brief.join("TRANSCRIPT.normalized.json"),
-            output: root.join("output.mp4"),
-            output_srt: root.join("output.srt"),
-            tts_dir: root.join("tts"),
-            clips_dir: root.join("clips"),
-            director_dir: root.join("director"),
-            review_dir: root.join("review"),
-            renders_dir: root.join("renders"),
-            render_manifest: root.join("render-manifest.json"),
-            brief,
+            meta: root.join("META.json"),
+            shorts: root.join("shorts"),
             root,
         }
     }
 
     pub fn ensure(&self) -> io::Result<()> {
-        fs::create_dir_all(&self.brief)?;
-        fs::create_dir_all(&self.tts_dir)?;
-        fs::create_dir_all(&self.clips_dir)?;
-        fs::create_dir_all(&self.director_dir)?;
-        fs::create_dir_all(&self.review_dir)?;
-        fs::create_dir_all(&self.renders_dir)?;
-        Ok(())
+        fs::create_dir_all(&self.root)
     }
 }
 
@@ -96,11 +75,17 @@ pub fn migrate_legacy_job(output_dir: impl AsRef<Path>, task_id: &str) -> io::Re
 
 fn normalize_canonical_names(paths: &JobPaths) -> io::Result<()> {
     let old_transcript = paths.root.join("transcript.srt");
-    if old_transcript.exists() {
+    // On the default case-insensitive macOS filesystem, `transcript.srt`
+    // resolves to `TRANSCRIPT.srt`. Only migrate an entry whose actual name
+    // is lower-case; otherwise this cleanup deletes the canonical file.
+    let has_old_spelling = fs::read_dir(&paths.root)?
+        .filter_map(Result::ok)
+        .any(|entry| entry.file_name() == "transcript.srt");
+    if has_old_spelling {
         if !paths.transcript.exists() {
             move_file(&old_transcript, &paths.transcript)?;
         } else if same_file(&old_transcript, &paths.transcript) {
-            fs::remove_file(old_transcript)?;
+            fs::rename(&old_transcript, &paths.transcript)?;
         } else {
             let conflicts = paths.root.join("legacy");
             fs::create_dir_all(&conflicts)?;
@@ -131,6 +116,7 @@ fn restore_canonical_transcript(root: &Path, transcript: &Path) -> io::Result<()
                         && !lower.contains("sensevoice")
                         && !lower.contains("whisper")
                         && !lower.contains(".asr.")
+                        && !lower.contains(".ocr.")
                 })
         })
         .collect::<Vec<_>>();
@@ -142,12 +128,10 @@ fn restore_canonical_transcript(root: &Path, transcript: &Path) -> io::Result<()
             .to_ascii_lowercase();
         if name.contains(".embedded.") {
             0
-        } else if name.contains(".ocr.") {
-            1
         } else if name.contains(".zh") {
-            2
+            1
         } else {
-            3
+            2
         }
     });
     if let Some(source) = candidates.first() {
@@ -326,17 +310,9 @@ pub fn find_subtitle_in_dir(dir: &Path, stem: &str) -> Option<PathBuf> {
         })
         .collect();
 
-    for lang in ["zh", "en", "ja", "ko"] {
-        if let Some(path) = entries.iter().find(|p| {
-            p.to_string_lossy()
-                .to_lowercase()
-                .contains(&format!(".{lang}"))
-        }) {
-            return Some(path.clone());
-        }
-    }
-
-    entries.into_iter().next()
+    entries
+        .into_iter()
+        .min_by_key(|path| subtitle_language_rank(path))
 }
 
 /// Best-effort migration helper for tasks created before transcript provenance
@@ -366,7 +342,7 @@ pub fn infer_subtitle_source(root: &Path) -> Option<String> {
         if name.contains(".embedded.") {
             "视频内封字幕"
         } else if name.contains(".ocr.") {
-            "画面硬字幕 OCR"
+            "画面硬字幕 OCR（已停用）"
         } else if name.contains("sensevoice") || name.contains("whisper") || name.contains(".asr.")
         {
             "旧版语音字幕（历史任务）"
@@ -426,23 +402,36 @@ pub fn relocate_downloaded_subtitles(
 }
 
 fn subtitle_language_rank(path: &Path) -> u8 {
-    let name = path.to_string_lossy().to_lowercase();
-    if name.contains(".zh") {
-        0
-    } else if name.contains(".en") {
-        1
-    } else if name.contains(".ja") {
-        2
-    } else if name.contains(".ko") {
-        3
-    } else {
-        4
+    let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+    let language = stem
+        .split_once('.')
+        .map(|(_, language)| language.to_ascii_lowercase());
+    match language.as_deref() {
+        Some("zh-cn" | "zh") => 0,
+        Some("zh-hans-zh-cn") => 1,
+        Some("zh-hans" | "zh-hant") => 2,
+        Some("en" | "en-orig" | "en-us" | "en-gb") => 3,
+        Some("ja") => 4,
+        Some("ko") => 5,
+        // Unknown translation variants are a last resort, not native Chinese.
+        _ => 6,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn packaged_app_uses_user_data_when_source_checkout_is_absent() {
+        let root = std::env::temp_dir().join(format!("vc-inbox-root-{}", std::process::id()));
+        let repo = root.join("missing-source");
+        let data = root.join("user-data");
+        assert_eq!(
+            inbox_root_for(&repo, Some(data.clone())),
+            data.join("com.esun.video-commentary/inbox")
+        );
+    }
 
     #[test]
     fn merges_legacy_resources_without_overwriting_inbox() {
@@ -479,6 +468,29 @@ mod tests {
     }
 
     #[test]
+    fn repeated_migration_preserves_canonical_transcript() {
+        let tmp = std::env::temp_dir().join(format!("vc-canonical-case-{}", std::process::id()));
+        let root = tmp.join("job-case");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("TRANSCRIPT.srt"), b"selected simplified subtitle").unwrap();
+        let paths = JobPaths {
+            root: root.clone(),
+            source: root.join("source.mp4"),
+            transcript: root.join("TRANSCRIPT.srt"),
+            meta: root.join("META.json"),
+            shorts: root.join("shorts"),
+        };
+        normalize_canonical_names(&paths).unwrap();
+        normalize_canonical_names(&paths).unwrap();
+        assert_eq!(
+            fs::read(&paths.transcript).unwrap(),
+            b"selected simplified subtitle"
+        );
+        let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
     fn keeps_same_directory_subtitles_and_prefers_chinese() {
         let tmp = std::env::temp_dir().join(format!(
             "vc-subs-{}-{:?}",
@@ -501,6 +513,18 @@ mod tests {
         assert!(english.exists());
         assert!(selected.exists());
         let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn native_or_known_chinese_beats_unrelated_auto_translation() {
+        let simplified = Path::new("source.zh-CN.srt");
+        let auto_hans = Path::new("source.zh-Hans.srt");
+        let native = Path::new("source.zh-Hans-zh-CN.srt");
+        let translated = Path::new("source.zh-Hans-ar.srt");
+        let english = Path::new("source.en.srt");
+        assert!(subtitle_language_rank(simplified) < subtitle_language_rank(auto_hans));
+        assert!(subtitle_language_rank(native) < subtitle_language_rank(translated));
+        assert!(subtitle_language_rank(english) < subtitle_language_rank(translated));
     }
 
     #[test]

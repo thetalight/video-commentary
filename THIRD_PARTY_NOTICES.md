@@ -2,7 +2,7 @@
 
 ## Rig (rig-core 0.42.0)
 
-The opening-sample LLM adapter depends on [Rig](https://github.com/0xPlaygrounds/rig), under the MIT License.
+The DeepSeek text-generation adapter depends on [Rig](https://github.com/0xPlaygrounds/rig), under the MIT License.
 
 Copyright (c) 2024, Playgrounds Analytics Inc.
 

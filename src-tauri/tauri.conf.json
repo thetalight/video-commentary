@@ -21,17 +21,13 @@
       "csp": "default-src 'self'; img-src 'self' asset: http://asset.localhost data:; media-src 'self' asset: http://asset.localhost; style-src 'self' 'unsafe-inline'; connect-src 'self' ipc: http://ipc.localhost http://127.0.0.1:* http://localhost:*",
       "assetProtocol": {
         "enable": true,
-        "scope": [
-          "/Users/product/video_commentary/inbox/**",
-          "/Users/product/video_commentary/inbox/.voice-previews/*.mp3"
-        ]
+        "scope": []
       }
     }
   },
   "bundle": {
     "active": true,
     "targets": "all",
-    "externalBin": ["binaries/subtitle-ocr"],
     "resources": ["ytdlp_plugins"],
     "macOS": {
       "entitlements": "Entitlements.plist"

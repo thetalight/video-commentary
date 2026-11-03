@@ -16,8 +16,7 @@ pub struct AppState {
     app: AppHandle,
     task_locks: Mutex<HashMap<String, Arc<AsyncMutex<()>>>>,
     download_slots: Arc<Semaphore>,
-    director_slots: Arc<Semaphore>,
-    subtitle_ocr_slots: Arc<Semaphore>,
+    ai_slots: Arc<Semaphore>,
     render_slots: Arc<Semaphore>,
 }
 
@@ -27,8 +26,7 @@ impl AppState {
             app,
             task_locks: Mutex::new(HashMap::new()),
             download_slots: Arc::new(Semaphore::new(2)),
-            director_slots: Arc::new(Semaphore::new(2)),
-            subtitle_ocr_slots: Arc::new(Semaphore::new(1)),
+            ai_slots: Arc::new(Semaphore::new(2)),
             render_slots: Arc::new(Semaphore::new(1)),
         }
     }
@@ -52,20 +50,12 @@ impl AppState {
             .map_err(|_| "下载调度器已关闭".to_string())
     }
 
-    pub async fn acquire_director(&self) -> Result<OwnedSemaphorePermit, String> {
-        self.director_slots
+    pub async fn acquire_ai(&self) -> Result<OwnedSemaphorePermit, String> {
+        self.ai_slots
             .clone()
             .acquire_owned()
             .await
-            .map_err(|_| "AI 导演调度器已关闭".to_string())
-    }
-
-    pub async fn acquire_subtitle_ocr(&self) -> Result<OwnedSemaphorePermit, String> {
-        self.subtitle_ocr_slots
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| "字幕识别调度器已关闭".to_string())
+            .map_err(|_| "AI 调度器已关闭".to_string())
     }
 
     pub async fn acquire_render(&self) -> Result<OwnedSemaphorePermit, String> {
@@ -101,7 +91,7 @@ impl AppState {
     }
 
     pub fn sanitize_output_dir(config: &mut AppConfig) {
-        // v2 stores every task under the repository inbox. Keep the setting for
+        // New tasks use the active inbox. Keep the setting for
         // reading/migrating old `<output>/jobs` directories, but never use it as
         // the destination for new task resources.
         if config.output_dir.trim().is_empty()
@@ -113,7 +103,7 @@ impl AppState {
         }
     }
 
-    fn sanitize_director(config: &mut AppConfig) {
+    fn sanitize_ai(config: &mut AppConfig) {
         // Every AI stage is local-only and the settings schema no longer contains
         // cloud provider fields. Deserializing and saving an old record purges them.
         let base = config.ollama_base_url.trim().trim_end_matches('/');
@@ -124,7 +114,6 @@ impl AppState {
                 "http://127.0.0.1:11434".to_string()
             };
         config.ollama_model = config.ollama_model.trim().to_string();
-        config.ollama_vision_model = config.ollama_vision_model.trim().to_string();
     }
 
     pub async fn get_config(&self) -> Result<AppConfig, Box<dyn std::error::Error + Send + Sync>> {
@@ -144,18 +133,23 @@ impl AppState {
 
         let before = config.output_dir.clone();
         let cookies_before = config.cookies_browser.clone();
+        let voice_before = config.tts_voice.clone();
         let _ = crate::services::jobs::migrate_all_legacy_jobs(&before);
         Self::sanitize_output_dir(&mut config);
         // Perform the one-time v1 migration before making inbox the fixed root.
         let _ = crate::services::jobs::migrate_all_legacy_jobs(&config.output_dir);
         let _ = crate::services::jobs::migrate_all_legacy_jobs(crate::services::jobs::repo_root());
         config.output_dir = default_output_dir();
-        Self::sanitize_director(&mut config);
+        Self::sanitize_ai(&mut config);
+        if crate::services::tts::validate_voice(&config.tts_voice).is_err() {
+            config.tts_voice = AppConfig::default().tts_voice;
+        }
         if config.cookies_browser == "safari" {
             config.cookies_browser.clear();
         }
         if config.output_dir != before
             || config.cookies_browser != cookies_before
+            || config.tts_voice != voice_before
             || had_cloud_settings
         {
             self.save_config(config.clone()).await?;
@@ -172,7 +166,7 @@ impl AppState {
         }
         Self::sanitize_output_dir(&mut config);
         config.output_dir = default_output_dir();
-        Self::sanitize_director(&mut config);
+        Self::sanitize_ai(&mut config);
         let store = self.app.store(STORE_PATH)?;
         store.set(CONFIG_KEY, serde_json::to_value(&config)?);
         store.save()?;

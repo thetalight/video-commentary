@@ -1,43 +1,21 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
-import {
-  deleteJob,
-  generateDirectorPlan,
-  listExistingJobs,
-  prepareJob,
-  refetchPlatformSubtitleAndGenerate,
-  renderJob,
-} from "../lib/api";
-import {
-  MAX_QUEUE_SIZE,
-  type PrepareResult,
-  type RenderResult,
-  type TaskCompletePayload,
-  type TaskProgress,
-} from "../lib/types";
-import {
-  QueueFullError,
-  newQueueTaskId,
-  type QueueTaskStatus,
-} from "./taskQueueShared";
-
-export type TaskKind = "prepare" | "render";
+import { deleteJob, listExistingJobs, prepareJob, refetchSubtitles } from "../lib/api";
+import { MAX_QUEUE_SIZE, type PrepareResult, type TaskProgress } from "../lib/types";
+import { QueueFullError, newQueueTaskId, type QueueTaskStatus } from "./taskQueueShared";
 
 export interface CommentaryTask {
   id: string;
-  kind: TaskKind;
   label: string;
   url?: string;
   style?: string;
   status: QueueTaskStatus;
   progress: TaskProgress | null;
   prepare?: PrepareResult;
-  render?: RenderResult;
-  outputPath?: string;
   error?: string;
   restored?: boolean;
   failedStage?: string;
-  errorCode?: string;
+  shortsRendered: number;
 }
 
 export { QueueFullError };
@@ -64,34 +42,23 @@ export function useTaskQueue() {
     setTasks(next);
   }, []);
 
+  const patch = useCallback(
+    (taskId: string, change: (task: CommentaryTask) => Partial<CommentaryTask>) =>
+      syncTasks((prev) =>
+        prev.map((task) => (task.id === taskId ? { ...task, ...change(task) } : task)),
+      ),
+    [syncTasks],
+  );
+
   useEffect(() => {
     const unProgress = listen<TaskProgress>("task-progress", (event) => {
       const taskId = event.payload.task_id;
-      if (!taskId) return;
-      syncTasks((prev) =>
-        prev.map((task) =>
-          task.id === taskId ? { ...task, progress: event.payload } : task,
-        ),
-      );
+      if (taskId) patch(taskId, () => ({ progress: event.payload }));
     });
-
-    const unComplete = listen<TaskCompletePayload>("task-complete", (event) => {
-      const taskId = event.payload.task_id;
-      if (!taskId) return;
-      syncTasks((prev) =>
-        prev.map((task) =>
-          task.id === taskId && event.payload.output_path.toLowerCase().endsWith(".mp4")
-            ? { ...task, outputPath: event.payload.output_path }
-            : task,
-        ),
-      );
-    });
-
     return () => {
       unProgress.then((fn) => fn());
-      unComplete.then((fn) => fn());
     };
-  }, [syncTasks]);
+  }, [patch]);
 
   useEffect(() => {
     let cancelled = false;
@@ -104,10 +71,6 @@ export function useTaskQueue() {
             .filter((job) => !activeIds.has(job.task_id))
             .map((job) => ({
               id: job.task_id,
-              kind:
-                job.status === "completed" || ["tts", "render", "burn"].includes(job.stage)
-                  ? "render"
-                  : "prepare",
               label: job.title,
               url: job.retry_url ?? undefined,
               status: job.status,
@@ -121,11 +84,10 @@ export function useTaskQueue() {
                     }
                   : null,
               prepare: job.prepare,
-              outputPath: job.output_path ?? undefined,
               error: job.error ?? undefined,
               failedStage: job.stage || undefined,
-              errorCode: job.error_code ?? undefined,
               restored: true,
+              shortsRendered: job.shorts_rendered,
             }));
           return [...restored, ...current];
         });
@@ -138,82 +100,39 @@ export function useTaskQueue() {
     };
   }, [syncTasks]);
 
-  const pumpQueue = useCallback(() => {
-    // Dispatch queued commands immediately. The Rust task manager owns the
-    // actual resource limits (download 2, AI 2, subtitle OCR 1, render 1), so the UI is
-    // only a projection and never the concurrency authority.
-    const queued = tasksRef.current.filter((task) => task.status === "queued");
-
-    for (const task of queued) {
-      runningIdsRef.current.add(task.id);
-      syncTasks((prev) =>
-        prev.map((t) =>
-          t.id === task.id
-            ? { ...t, status: "running", progress: null, error: undefined }
-            : t,
-        ),
-      );
-
-      void (async () => {
-        try {
-          if (task.kind === "prepare" && task.url) {
-            const result = await prepareJob(
-              task.url,
-              task.id,
-              task.style,
-            );
-            syncTasks((prev) =>
-              prev.map((t) =>
-                t.id === task.id
-                  ? {
-                      ...t,
-                      status: result.waiting_for_director ? "awaiting_director" : "ready",
-                      prepare: result,
-                      label: result.title || t.label,
-                    }
-                  : t,
-              ),
-            );
-          } else if (task.kind === "render") {
-            const result = await renderJob(task.id);
-            syncTasks((prev) =>
-              prev.map((t) =>
-                t.id === task.id
-                  ? {
-                      ...t,
-                      status: "completed",
-                      render: result,
-                      outputPath: result.output_path,
-                      label: result.title || t.label,
-                    }
-                  : t,
-              ),
-            );
-          } else {
-            throw new Error("任务参数不完整");
-          }
-        } catch (error) {
-          const current = tasksRef.current.find((candidate) => candidate.id === task.id);
-          syncTasks((prev) =>
-            prev.map((t) =>
-              t.id === task.id
-                ? {
-                    ...t,
-                    status: "failed",
-                    error: String(error),
-                    failedStage:
-                      current?.progress?.step ?? (task.kind === "render" ? "render" : "download"),
-                  }
-                : t,
-            ),
-          );
-        } finally {
-          runningIdsRef.current.delete(task.id);
-          pumpQueue();
-        }
-      })();
-    }
-  }, [syncTasks]);
+  /** Run one ingest command; the Rust side owns the real concurrency limits. */
+  const run = useCallback(
+    async (taskId: string, step: string, message: string, command: () => Promise<PrepareResult>) => {
+      if (runningIdsRef.current.has(taskId)) return;
+      runningIdsRef.current.add(taskId);
+      patch(taskId, () => ({
+        status: "running",
+        restored: false,
+        error: undefined,
+        progress: { task_id: taskId, step, percent: 0, message },
+      }));
+      try {
+        const result = await command();
+        patch(taskId, (task) => ({
+          status: task.shortsRendered > 0 ? "completed" : "ready",
+          prepare: result,
+          label: result.title || task.label,
+          progress: null,
+          failedStage: undefined,
+        }));
+      } catch (error) {
+        patch(taskId, (task) => ({
+          status: "failed",
+          error: String(error),
+          failedStage: task.progress?.step ?? step,
+          progress: null,
+        }));
+      } finally {
+        runningIdsRef.current.delete(taskId);
+      }
+    },
+    [patch],
+  );
 
   const enqueuePrepare = useCallback(
     (url: string, style: string) => {
@@ -224,306 +143,56 @@ export function useTaskQueue() {
       setQueueError(null);
       const task: CommentaryTask = {
         id: newQueueTaskId("job"),
-        kind: "prepare",
         label: truncateUrl(url),
         url: url.trim(),
         style,
         status: "queued",
         progress: null,
+        shortsRendered: 0,
       };
       syncTasks((prev) => [...prev, task]);
-      pumpQueue();
+      void run(task.id, "download", "正在启动...", () => prepareJob(task.url!, task.id, style));
       return task.id;
     },
-    [pumpQueue, syncTasks],
-  );
-
-  const enqueueRender = useCallback(
-    (prepare: PrepareResult) => {
-      if (runningIdsRef.current.has(prepare.task_id)) return;
-      syncTasks((prev) =>
-        prev.map((t) =>
-          t.id === prepare.task_id
-            ? {
-                ...t,
-                kind: "render",
-                status: "queued",
-                progress: null,
-                error: undefined,
-                prepare,
-                restored: false,
-              }
-            : t,
-        ),
-      );
-      pumpQueue();
-    },
-    [pumpQueue, syncTasks],
-  );
-
-  const retryFailedTask = useCallback(
-    async (taskId: string) => {
-      const original = tasksRef.current.find((task) => task.id === taskId);
-      if (!original || original.status !== "failed" || runningIdsRef.current.has(taskId)) {
-        return;
-      }
-
-      const failedStage = original.failedStage ?? "";
-      const isRenderStage = ["tts", "render", "burn"].includes(failedStage);
-      const retryStep = isRenderStage
-        ? failedStage
-        : failedStage === "director"
-          ? "director"
-          : failedStage === "download_subtitle"
-            ? "download_subtitle"
-            : failedStage === "transcribe"
-              ? "transcribe"
-              : original.prepare?.transcript_available
-                ? "director"
-                : original.prepare?.source_available
-                  ? "transcribe"
-                  : "download";
-
-      runningIdsRef.current.add(taskId);
-      syncTasks((prev) =>
-        prev.map((task) =>
-          task.id === taskId
-            ? {
-                ...task,
-                kind: isRenderStage ? "render" : "prepare",
-                status: "running",
-                restored: false,
-                progress: {
-                  task_id: taskId,
-                  step: retryStep,
-                  percent: 0,
-                  message: "正在从失败阶段重试...",
-                },
-                error: undefined,
-              }
-            : task,
-        ),
-      );
-
-      try {
-        if (isRenderStage && original.prepare?.plan) {
-          const result = await renderJob(taskId);
-          syncTasks((prev) =>
-            prev.map((task) =>
-              task.id === taskId
-                ? {
-                    ...task,
-                    kind: "render",
-                    status: "completed",
-                    render: result,
-                    outputPath: result.output_path,
-                    label: result.title || task.label,
-                    progress: null,
-                    failedStage: undefined,
-                    errorCode: undefined,
-                  }
-                : task,
-            ),
-          );
-          return;
-        }
-
-        let result: PrepareResult;
-        if (failedStage === "download_subtitle" && original.prepare?.source_available) {
-          result = await refetchPlatformSubtitleAndGenerate(taskId);
-        } else if (failedStage === "transcribe" && original.prepare?.source_available) {
-          result = await refetchPlatformSubtitleAndGenerate(taskId);
-        } else if (
-          (failedStage === "director" || original.prepare?.transcript_available) &&
-          original.prepare?.transcript_available
-        ) {
-          result = await generateDirectorPlan(taskId);
-        } else if (original.prepare?.source_available) {
-          result = await refetchPlatformSubtitleAndGenerate(taskId);
-        } else if (original.url) {
-          result = await prepareJob(original.url, taskId, original.style);
-        } else {
-          throw new Error("该任务缺少原始视频和播放链接，无法自动重试下载");
-        }
-
-        syncTasks((prev) =>
-          prev.map((task) =>
-            task.id === taskId
-              ? {
-                  ...task,
-                  kind: "prepare",
-                  status: result.waiting_for_director ? "awaiting_director" : "ready",
-                  prepare: result,
-                  label: result.title || task.label,
-                  progress: null,
-                  failedStage: undefined,
-                  errorCode: undefined,
-                  error: result.director_error ?? undefined,
-                }
-              : task,
-          ),
-        );
-      } catch (error) {
-        const current = tasksRef.current.find((task) => task.id === taskId);
-        syncTasks((prev) =>
-          prev.map((task) =>
-            task.id === taskId
-              ? {
-                  ...task,
-                  status: "failed",
-                  progress: null,
-                  error: String(error),
-                  failedStage: current?.progress?.step ?? retryStep,
-                }
-              : task,
-          ),
-        );
-      } finally {
-        runningIdsRef.current.delete(taskId);
-      }
-    },
-    [syncTasks],
-  );
-
-  const regenerateDirector = useCallback(
-    async (taskId: string) => {
-      if (runningIdsRef.current.has(taskId)) return;
-      runningIdsRef.current.add(taskId);
-      syncTasks((prev) =>
-        prev.map((task) =>
-          task.id === taskId
-            ? {
-                ...task,
-                kind: "prepare",
-                status: "running",
-                restored: false,
-                outputPath: undefined,
-                render: undefined,
-                progress: {
-                  task_id: taskId,
-                  step: "director",
-                  percent: 70,
-                  message: "正在重新生成 AI 导演稿...",
-                },
-                error: undefined,
-              }
-            : task,
-        ),
-      );
-      try {
-        const result = await generateDirectorPlan(taskId);
-        syncTasks((prev) =>
-          prev.map((task) =>
-            task.id === taskId
-              ? {
-                  ...task,
-                  status: "ready",
-                  prepare: result,
-                  label: result.title || task.label,
-                  progress: null,
-                }
-              : task,
-          ),
-        );
-      } catch (error) {
-        syncTasks((prev) =>
-          prev.map((task) =>
-            task.id === taskId
-              ? {
-                  ...task,
-                  status: "awaiting_director",
-                  progress: null,
-                  error: String(error),
-                  failedStage: "director",
-                }
-              : task,
-          ),
-        );
-      } finally {
-        runningIdsRef.current.delete(taskId);
-      }
-    },
-    [syncTasks],
+    [run, syncTasks],
   );
 
   const refetchSubtitleTask = useCallback(
-    async (taskId: string) => {
-      if (runningIdsRef.current.has(taskId)) return;
-      runningIdsRef.current.add(taskId);
-      syncTasks((prev) =>
-        prev.map((task) =>
-          task.id === taskId
-            ? {
-                ...task,
-                kind: "prepare",
-                status: "running",
-                restored: false,
-                outputPath: undefined,
-                render: undefined,
-                progress: {
-                  task_id: taskId,
-                  step: "download",
-                  percent: 0,
-                  message: "正在重新获取最佳字幕...",
-                },
-                error: undefined,
-              }
-            : task,
-        ),
-      );
-      try {
-        const result = await refetchPlatformSubtitleAndGenerate(taskId);
-        syncTasks((prev) =>
-          prev.map((task) =>
-            task.id === taskId
-              ? {
-                  ...task,
-                  status: "ready",
-                  prepare: result,
-                  label: result.title || task.label,
-                  progress: null,
-                }
-              : task,
-          ),
-        );
-      } catch (error) {
-        syncTasks((prev) =>
-          prev.map((task) =>
-            task.id === taskId
-              ? {
-                  ...task,
-                  status: "failed",
-                  progress: null,
-                  error: String(error),
-                  failedStage: "download_subtitle",
-                }
-              : task,
-          ),
-        );
-      } finally {
-        runningIdsRef.current.delete(taskId);
-      }
-    },
-    [syncTasks],
+    (taskId: string) =>
+      run(taskId, "download_subtitle", "正在重新获取字幕...", () => refetchSubtitles(taskId)),
+    [run],
   );
 
-  const updatePrepare = useCallback(
-    (taskId: string, prepare: PrepareResult) => {
-      syncTasks((prev) =>
-        prev.map((t) =>
-          t.id === taskId
-            ? {
-                ...t,
-                prepare,
-                status: "ready",
-                outputPath: undefined,
-                render: undefined,
-              }
-            : t,
-        ),
-      );
+  /** A downloaded film only needs its subtitles retried; otherwise start over from the link. */
+  const retryFailedTask = useCallback(
+    async (taskId: string) => {
+      const task = tasksRef.current.find((candidate) => candidate.id === taskId);
+      if (!task || task.status !== "failed") return;
+      if (task.prepare?.source_available) {
+        await refetchSubtitleTask(taskId);
+      } else if (task.url) {
+        await run(taskId, "download", "正在重新下载...", () =>
+          prepareJob(task.url!, taskId, task.style),
+        );
+      } else {
+        patch(taskId, () => ({ error: "该任务缺少原始视频和播放链接，无法自动重试下载" }));
+      }
     },
-    [syncTasks],
+    [patch, refetchSubtitleTask, run],
+  );
+
+  const setShortsRendered = useCallback(
+    (taskId: string, rendered: number) =>
+      patch(taskId, (task) => ({
+        shortsRendered: rendered,
+        status:
+          task.status === "ready" || task.status === "completed"
+            ? rendered > 0
+              ? "completed"
+              : "ready"
+            : task.status,
+      })),
+    [patch],
   );
 
   const removeTask = useCallback(
@@ -548,21 +217,16 @@ export function useTaskQueue() {
     setQueueError(null);
   }, [syncTasks]);
 
-  const runningCount = tasks.filter((task) => task.status === "running").length;
-  const queuedCount = tasks.filter((task) => task.status === "queued").length;
-
   return {
     tasks,
-    runningCount,
-    queuedCount,
+    runningCount: tasks.filter((task) => task.status === "running").length,
+    queuedCount: tasks.filter((task) => task.status === "queued").length,
     isQueueFull: liveQueueSize(tasks) >= MAX_QUEUE_SIZE,
     queueError,
     enqueuePrepare,
-    enqueueRender,
     retryFailedTask,
-    regenerateDirector,
     refetchSubtitleTask,
-    updatePrepare,
+    setShortsRendered,
     removeTask,
     clearFinished,
   };

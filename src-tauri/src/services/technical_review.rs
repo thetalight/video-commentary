@@ -1,4 +1,5 @@
-//! Deterministic local rough-cut checks. These diagnostics do not infer story meaning.
+//! Deterministic local render checks. These diagnostics do not infer story meaning.
+use super::subtitle::{self, SubtitleEntry};
 use serde::{Deserialize, Serialize};
 use std::{path::Path, process::Command};
 
@@ -7,62 +8,53 @@ pub struct Span {
     pub start: f64,
     pub end: f64,
 }
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TechnicalReview {
     pub duration: f64,
     pub freezes: Vec<Span>,
     pub black_frames: Vec<Span>,
     pub silences: Vec<Span>,
-    pub warnings: Vec<String>,
 }
 
 impl TechnicalReview {
-    #[cfg(test)]
-    pub fn blocking_reasons(&self) -> Vec<String> {
-        self.blocking_reasons_for_narration(&[])
-    }
-
-    /// Silence or black frames are deterministic render failures only when they
-    /// overlap commentary speech. Quiet or black source footage after an
-    /// original-audio handoff can be an authored pause/fade and remains a warning.
-    pub fn blocking_reasons_for_narration(
-        &self,
-        narration: &[super::subtitle::SubtitleEntry],
-    ) -> Vec<String> {
-        let mut reasons = Vec::new();
-        if let Some(span) = self.freezes.iter().find(|s| s.end - s.start >= 5.0) {
-            reasons.push(format!(
-                "{:.1}–{:.1} 秒出现超过5秒的近似静止画面",
-                span.start, span.end
-            ));
-        }
-        let black = self.black_frames.iter().find(|span| {
-            span.end - span.start >= 1.5
-                && (narration.is_empty() || narration_overlap_seconds(span, narration) >= 1.0)
-        });
-        if let Some(span) = black {
-            reasons.push(format!("{:.1}–{:.1} 秒出现持续黑场", span.start, span.end));
-        }
-        let silence = self.silences.iter().find(|span| {
-            span.end - span.start >= 5.0
-                && (narration.is_empty() || narration_overlap_seconds(span, narration) >= 2.0)
-        });
-        if let Some(span) = silence {
-            reasons.push(format!(
-                "{:.1}–{:.1} 秒的解说区间出现超过5秒静音",
-                span.start, span.end
-            ));
-        }
-        reasons
+    /// Silence while a caption says narration is playing is a broken render and
+    /// blocks publishing. Black or static picture can be genuine source footage,
+    /// so it is reported for the editor to judge.
+    pub fn assess(&self, narration: &[SubtitleEntry]) -> (Vec<String>, Vec<String>) {
+        let blocking = self
+            .silences
+            .iter()
+            .filter(|span| overlap_seconds(span, narration) >= 1.0)
+            .map(|span| format!("{:.1}–{:.1} 秒解说应在播放却没有声音", span.start, span.end))
+            .collect();
+        let mut notes: Vec<String> = self
+            .black_frames
+            .iter()
+            .filter(|span| span.end - span.start >= 1.0 && overlap_seconds(span, narration) >= 0.5)
+            .map(|span| {
+                format!(
+                    "{:.1}–{:.1} 秒画面接近全黑，可取消勾选对应镜头",
+                    span.start, span.end
+                )
+            })
+            .collect();
+        notes.extend(
+            self.freezes
+                .iter()
+                .filter(|span| span.end - span.start >= 3.0)
+                .map(|span| format!("{:.1}–{:.1} 秒画面几乎静止", span.start, span.end)),
+        );
+        (blocking, notes)
     }
 }
 
-fn narration_overlap_seconds(span: &Span, narration: &[super::subtitle::SubtitleEntry]) -> f64 {
+fn overlap_seconds(span: &Span, narration: &[SubtitleEntry]) -> f64 {
     let mut intervals = narration
         .iter()
         .filter_map(|entry| {
-            let start = super::subtitle::time_to_secs(&entry.start).max(span.start);
-            let end = super::subtitle::time_to_secs(&entry.end).min(span.end);
+            let start = subtitle::time_to_secs(&entry.start).max(span.start);
+            let end = subtitle::time_to_secs(&entry.end).min(span.end);
             (end > start).then_some((start, end))
         })
         .collect::<Vec<_>>();
@@ -125,37 +117,41 @@ pub fn review(path: &Path) -> Result<TechnicalReview, String> {
         .map_err(|e| e.to_string())?;
     if !output.status.success() {
         return Err(format!(
-            "本地粗剪技术检查失败：{}",
+            "本地技术检查失败：{}",
             String::from_utf8_lossy(&output.stderr)
         ));
     }
     let log = String::from_utf8_lossy(&output.stderr);
-    let freezes = spans(&log, "freeze_start", "freeze_end");
-    let black_frames = spans(&log, "black_start", "black_end");
-    let silences = spans(&log, "silence_start", "silence_end");
-    let duration = super::ffmpeg::get_duration(path).map_err(|e| e.to_string())?;
-    let mut warnings = vec![];
-    if freezes.iter().any(|s| s.end - s.start >= 3.0) {
-        warnings.push("检测到超过3秒的近似静止画面；可能是原片静态构图，需结合视觉评审确认".into());
-    }
-    if black_frames.iter().any(|s| s.end - s.start >= 1.0) {
-        warnings.push("检测到超过1秒的黑场".into());
-    }
-    if silences.iter().any(|s| s.end - s.start >= 3.0) {
-        warnings.push("检测到超过3秒的静音".into());
-    }
     Ok(TechnicalReview {
-        duration,
-        freezes,
-        black_frames,
-        silences,
-        warnings,
+        duration: super::ffmpeg::get_duration(path).map_err(|e| e.to_string())?,
+        freezes: spans(&log, "freeze_start", "freeze_end"),
+        black_frames: spans(&log, "black_start", "black_end"),
+        silences: spans(&log, "silence_start", "silence_end"),
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn caption(start: &str, end: &str) -> SubtitleEntry {
+        SubtitleEntry {
+            index: 1,
+            start: start.into(),
+            end: end.into(),
+            text: "解说".into(),
+        }
+    }
+
+    fn review(freezes: Vec<Span>, black_frames: Vec<Span>, silences: Vec<Span>) -> TechnicalReview {
+        TechnicalReview {
+            duration: 60.0,
+            freezes,
+            black_frames,
+            silences,
+        }
+    }
+
     #[test]
     fn parses_completed_spans_only() {
         let s = "freeze_start: 1.2 freeze_end: 3.8 black_start:0 black_end:1 silence_start: 8";
@@ -164,92 +160,32 @@ mod tests {
     }
 
     #[test]
-    fn long_freeze_black_or_silence_blocks_publish() {
-        let review = TechnicalReview {
-            duration: 30.0,
-            freezes: vec![Span {
-                start: 1.0,
-                end: 7.0,
-            }],
-            black_frames: vec![],
-            silences: vec![],
-            warnings: vec![],
-        };
-        assert!(review.blocking_reasons()[0].contains("静止画面"));
+    fn silence_blocks_only_under_narration() {
+        let captions = vec![caption("00:00:10,000", "00:00:14,000")];
+        let silent = |start, end| vec![Span { start, end }];
+        let (blocking, _) = review(vec![], vec![], silent(11.0, 13.5)).assess(&captions);
+        assert_eq!(blocking.len(), 1);
+        let (blocking, _) = review(vec![], vec![], silent(14.2, 16.0)).assess(&captions);
+        assert!(blocking.is_empty());
     }
 
     #[test]
-    fn silence_only_blocks_when_commentary_should_be_audible() {
-        let review = TechnicalReview {
-            duration: 120.0,
-            freezes: vec![],
-            black_frames: vec![],
-            silences: vec![Span {
-                start: 78.1,
-                end: 103.8,
+    fn black_and_static_picture_are_notes_not_failures() {
+        let captions = vec![caption("00:00:10,000", "00:00:14,000")];
+        let (blocking, notes) = review(
+            vec![Span {
+                start: 20.0,
+                end: 24.0,
             }],
-            warnings: vec![],
-        };
-        let captions = vec![
-            super::super::subtitle::SubtitleEntry {
-                index: 1,
-                start: "00:01:20,546".into(),
-                end: "00:01:24,534".into(),
-                text: "朋友指出老屋能免房租".into(),
-            },
-            super::super::subtitle::SubtitleEntry {
-                index: 2,
-                start: "00:01:25,546".into(),
-                end: "00:01:31,821".into(),
-                text: "小林以为这是人生最大的分岔点".into(),
-            },
-        ];
-        assert!(review
-            .blocking_reasons_for_narration(&captions)
-            .first()
-            .is_some_and(|reason| reason.contains("解说区间")));
-        assert!(review.blocking_reasons_for_narration(&[]).len() == 1);
-        let outside = vec![super::super::subtitle::SubtitleEntry {
-            index: 3,
-            start: "00:00:01,000".into(),
-            end: "00:00:03,000".into(),
-            text: "不在静音区间".into(),
-        }];
-        assert!(review.blocking_reasons_for_narration(&outside).is_empty());
-    }
-
-    #[test]
-    fn black_only_blocks_when_commentary_should_be_visible() {
-        let review = TechnicalReview {
-            duration: 120.0,
-            freezes: vec![],
-            black_frames: vec![Span {
-                start: 106.2,
-                end: 110.5,
+            vec![Span {
+                start: 9.0,
+                end: 12.0,
             }],
-            silences: vec![],
-            warnings: vec![],
-        };
-        let commentary_before_black = vec![super::super::subtitle::SubtitleEntry {
-            index: 1,
-            start: "00:01:14,209".into(),
-            end: "00:01:18,134".into(),
-            text: "引导结束，随后保留原片声音和画面".into(),
-        }];
-        assert!(review
-            .blocking_reasons_for_narration(&commentary_before_black)
-            .is_empty());
-
-        let commentary_over_black = vec![super::super::subtitle::SubtitleEntry {
-            index: 2,
-            start: "00:01:46,700".into(),
-            end: "00:01:49,900".into(),
-            text: "此时解说仍在继续".into(),
-        }];
-        assert!(review
-            .blocking_reasons_for_narration(&commentary_over_black)
-            .first()
-            .is_some_and(|reason| reason.contains("持续黑场")));
-        assert!(review.blocking_reasons_for_narration(&[])[0].contains("持续黑场"));
+            vec![],
+        )
+        .assess(&captions);
+        assert!(blocking.is_empty());
+        assert_eq!(notes.len(), 2);
+        assert!(notes[0].contains("全黑"));
     }
 }

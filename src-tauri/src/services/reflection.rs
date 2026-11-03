@@ -1,14 +1,14 @@
-//! Bounded, evidence-based sample review. No tools, no implicit full-plan rewrite.
+//! Bounded, evidence-based script review. No tools, no implicit whole-script rewrite.
 use super::{
-    director::{self, DirectorOptions},
-    jobs,
-    sample::{self, Paragraph, SamplePlan, Shot},
+    ai::AiOptions,
+    jobs, llm,
+    script::{self, Paragraph, Script, Shot},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{collections::HashSet, path::Path};
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Finding {
     pub paragraph_index: usize,
     pub verdict: String,
@@ -30,13 +30,13 @@ struct Repair {
     replacements: Vec<Replacement>,
 }
 
-fn revision(plan: &SamplePlan) -> Result<String, String> {
+fn revision(plan: &Script) -> Result<String, String> {
     Ok(jobs::stable_hash(&[
         &serde_json::to_vec(plan).map_err(|e| e.to_string())?
     ]))
 }
 
-fn targets(review: &Review, plan: &SamplePlan, shots: &[Shot]) -> Result<Vec<usize>, String> {
+fn targets(review: &Review, plan: &Script, shots: &[Shot]) -> Result<Vec<usize>, String> {
     let mut seen = HashSet::new();
     let mut targets = Vec::new();
     for finding in &review.findings {
@@ -68,7 +68,7 @@ fn targets(review: &Review, plan: &SamplePlan, shots: &[Shot]) -> Result<Vec<usi
     Ok(targets)
 }
 
-fn apply(plan: &SamplePlan, repair: Repair, allowed: &[usize]) -> Result<SamplePlan, String> {
+fn apply(plan: &Script, repair: Repair, allowed: &[usize]) -> Result<Script, String> {
     if repair.base_revision != revision(plan)? {
         return Err("修复引用旧稿，已拒绝覆盖".into());
     }
@@ -92,15 +92,15 @@ fn apply(plan: &SamplePlan, repair: Repair, allowed: &[usize]) -> Result<SampleP
     Ok(result)
 }
 
-fn rule_targets(plan: &SamplePlan, shots: &[Shot]) -> Vec<usize> {
+fn rule_targets(plan: &Script, shots: &[Shot]) -> Vec<usize> {
     let mut targets = Vec::new();
     let mut ranges: Vec<(usize, f64, f64)> = Vec::new();
     for (i, paragraph) in plan.paragraphs.iter().enumerate() {
-        let isolated = SamplePlan {
+        let isolated = Script {
             title: plan.title.clone(),
             paragraphs: vec![paragraph.clone()],
         };
-        if sample::validate(&isolated, shots).is_err() {
+        if script::validate(&isolated, shots).is_err() {
             targets.push(i);
         }
         for id in &paragraph.shot_ids {
@@ -128,31 +128,31 @@ fn save(root: &Path, name: &str, value: &impl Serialize) -> Result<(), String> {
 }
 
 pub async fn refine(
-    plan: SamplePlan,
+    plan: Script,
     shots: &[Shot],
-    options: &DirectorOptions,
+    options: &AiOptions,
     root: &Path,
     progress: impl Fn(&str),
-) -> Result<SamplePlan, String> {
+) -> Result<Script, String> {
     refine_with(
         plan,
         shots,
         root,
         progress,
         |system: String, user: String, schema| async move {
-            director::sample_json::<serde_json::Value>(options, &system, &user, schema).await
+            llm::json::<serde_json::Value>(options, &system, &user, schema).await
         },
     )
     .await
 }
 
 async fn refine_with<F, Fut>(
-    mut plan: SamplePlan,
+    mut plan: Script,
     shots: &[Shot],
     root: &Path,
     progress: impl Fn(&str),
     mut request: F,
-) -> Result<SamplePlan, String>
+) -> Result<Script, String>
 where
     F: FnMut(String, String, serde_json::Value) -> Fut,
     Fut: std::future::Future<Output = Result<serde_json::Value, String>>,
@@ -160,12 +160,12 @@ where
     std::fs::create_dir_all(root).map_err(|e| e.to_string())?;
     save(root, "evidence.json", &shots)?;
     let evidence = serde_json::to_string(shots).map_err(|e| e.to_string())?;
-    let mut best: Option<(SamplePlan, usize)> = None;
+    let mut best: Option<(Script, usize)> = None;
     // Initial audit plus at most two local repair attempts. Each call is single-shot.
     for round in 0..=2 {
         save(root, &format!("candidate-{round}.json"), &plan)?;
         progress(&format!(
-            "样片：第 {}/3 次逐段评审（最多两轮局部修复）",
+            "第 {}/3 次逐段评审（最多两轮局部修复）",
             round + 1
         ));
         let reviewed_revision = revision(&plan)?;
@@ -179,13 +179,13 @@ where
             &json!({"artifact_revision":reviewed_revision,"report":report}),
         )?;
         let mut allowed = targets(&report, &plan, shots)?;
-        let rules = sample::validate(&plan, shots).err();
+        let rules = script::validate(&plan, shots).err();
         // Rules are authoritative. Invalid selection can be repaired, never approved by the LLM.
         allowed.extend(rule_targets(&plan, shots));
         allowed.sort_unstable();
         allowed.dedup();
         if plan.paragraphs.is_empty() {
-            return Err("样片稿为空，需要重新创作，不能自动通过评审".into());
+            return Err("文案为空，需要重新创作，不能自动通过评审".into());
         }
         let score = allowed.len();
         if best.as_ref().is_some_and(|(_, old)| score > *old) {
@@ -203,7 +203,7 @@ where
             break;
         }
         progress(&format!(
-            "样片：仅修改 {} 个问题段，第 {}/2 轮",
+            "仅修改 {} 个问题段，第 {}/2 轮",
             allowed.len(),
             round + 1
         ));
@@ -218,18 +218,16 @@ where
             return Err("局部修复未改变稿件，已停止重复请求；草稿和评审已保存".into());
         }
         plan = next;
+        script::drop_redundant_reused_shots(&mut plan, shots);
     }
-    Err(
-        "样片两轮局部修复后仍有问题，已停止；较好候选与逐段评审保存在 reflection 目录，原成片不变"
-            .into(),
-    )
+    Err("两轮局部修复后仍有问题，已停止；较好候选与逐段评审保存在本条短片的运行目录".into())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn plan() -> SamplePlan {
-        SamplePlan {
+    fn plan() -> Script {
+        Script {
             title: "test".into(),
             paragraphs: vec![Paragraph {
                 narration: "原稿".into(),

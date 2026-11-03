@@ -1,11 +1,11 @@
-use tauri::{AppHandle, State};
+use tauri::State;
 
-use crate::models::config::{AppConfig, DependencyStatus, OllamaStatus};
-use crate::services::{deps, director};
+use crate::models::config::{AiStatus, AppConfig, DependencyStatus};
+use crate::services::{ai, deps};
 use crate::state::AppState;
 
 #[tauri::command]
-pub async fn preview_edge_voice(
+pub async fn preview_local_voice(
     state: State<'_, AppState>,
     voice: String,
 ) -> Result<String, String> {
@@ -14,12 +14,15 @@ pub async fn preview_edge_voice(
     tauri::async_runtime::spawn_blocking(move || {
         crate::services::tts::preview_voice(&voice)
             .map(|path| path.to_string_lossy().into_owned())
-            .map_err(|e| {
-                format!("Edge TTS 试听失败：{e}。未使用系统声音代替；可选择其他音色或检查网络。")
-            })
+            .map_err(|e| format!("本机音色试听失败：{e}。请在设置里选择已安装的中文音色。"))
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub fn list_local_voices() -> Vec<crate::services::tts::LocalVoice> {
+    crate::services::tts::local_voices()
 }
 
 #[tauri::command]
@@ -54,20 +57,23 @@ pub async fn save_settings(
     {
         return Err("背景音乐音量应为 -40 至 -8 dB".into());
     }
-    if config.source_caption_mask_percent > 0 {
-        config.burn_captions = true;
+    if config.original_audio_mode != "duck" {
+        config.original_audio_mode = "mute".into();
     }
     state.save_config(config).await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub async fn check_dependencies(app: AppHandle) -> Result<DependencyStatus, String> {
-    Ok(deps::check(crate::services::hard_subtitle::is_available(
-        &app,
-    )))
+pub async fn check_dependencies(state: State<'_, AppState>) -> Result<DependencyStatus, String> {
+    let model = state
+        .get_config()
+        .await
+        .map(|config| config.asr_model_path)
+        .unwrap_or_default();
+    Ok(deps::check(&model))
 }
 
 #[tauri::command]
-pub async fn check_ollama(base_url: String) -> Result<OllamaStatus, String> {
-    Ok(director::check_ollama(&base_url).await)
+pub async fn check_ai() -> AiStatus {
+    ai::check_ai().await
 }

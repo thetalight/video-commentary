@@ -340,14 +340,8 @@ pub fn bootstrap_existing_tasks() -> Result<(), String> {
             continue;
         }
         ensure_task(&task_id, title, source_url)?;
-        let (status, stage, message) = if root.join("edit.json").exists() {
-            ("ready", "review", "已导入旧任务，等待审稿或重新成片")
-        } else if root.join("TRANSCRIPT.srt").exists() {
-            (
-                "awaiting_director",
-                "director",
-                "已导入旧任务，等待 AI 导演",
-            )
+        let (status, stage, message) = if root.join("TRANSCRIPT.srt").exists() {
+            ("ready", "transcribe", "已导入旧任务，素材已就绪")
         } else if root.join("source.mp4").exists() {
             ("failed", "transcribe", "旧任务缺少可用字幕")
         } else {
@@ -385,7 +379,6 @@ mod tests {
 
     #[test]
     fn state_names_are_stable() {
-        assert_eq!("awaiting_director", "awaiting_director");
         assert!(now_ms() > 0);
     }
 }

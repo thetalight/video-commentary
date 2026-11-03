@@ -1,12 +1,6 @@
 import { MAX_QUEUE_SIZE } from "../lib/types";
 
-export type QueueTaskStatus =
-  | "queued"
-  | "running"
-  | "awaiting_director"
-  | "completed"
-  | "failed"
-  | "ready";
+export type QueueTaskStatus = "queued" | "running" | "ready" | "completed" | "failed";
 
 export class QueueFullError extends Error {
   constructor() {

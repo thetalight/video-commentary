@@ -3,6 +3,8 @@ pub enum VideoPlatform {
     Youtube,
     Twitter,
     Yfsp,
+    /// 苹果CMS(MacCMS) 型采集站，如努努影院，由 yt-dlp 插件解析 player_aaaa。
+    Nnyy,
     Generic,
 }
 
@@ -24,10 +26,23 @@ pub fn detect_platform(url: &str) -> Option<VideoPlatform> {
     if is_yfsp_play_url(trimmed) || is_yfsp_master_playlist_url(trimmed) {
         return Some(VideoPlatform::Yfsp);
     }
+    if is_nnyy_url(trimmed) {
+        return Some(VideoPlatform::Nnyy);
+    }
     if lower.starts_with("http://") || lower.starts_with("https://") {
         return Some(VideoPlatform::Generic);
     }
     None
+}
+
+fn is_nnyy_url(url: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(url) else {
+        return false;
+    };
+    parsed.host_str().is_some_and(|host| {
+        let host = host.to_ascii_lowercase();
+        host == "nnyy.in" || host.ends_with(".nnyy.in")
+    })
 }
 
 fn is_twitter_url(lower: &str) -> bool {
@@ -228,6 +243,22 @@ mod tests {
         let error = resolve_yfsp_download(original).unwrap_err();
 
         assert!(error.contains("预览清单"));
+    }
+
+    #[test]
+    fn detects_nnyy_pages_on_its_own_host() {
+        assert_eq!(
+            detect_platform("https://nnyy.in/dianshiju/20080573.html"),
+            Some(VideoPlatform::Nnyy)
+        );
+        assert_eq!(
+            detect_platform("https://www.nnyy.in/dianshiju/20080573-1-1.html"),
+            Some(VideoPlatform::Nnyy)
+        );
+        assert_eq!(
+            detect_platform("https://nnyy.in.evil.example/dianshiju/1.html"),
+            Some(VideoPlatform::Generic)
+        );
     }
 
     #[test]

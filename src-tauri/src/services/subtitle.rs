@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
 
+use crate::models::config::ExcludedRange;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubtitleEntry {
     pub index: u32,
@@ -146,18 +148,6 @@ pub fn secs_to_time(secs: f64) -> String {
     format!("{h:02}:{m:02}:{s:02},{ms:03}")
 }
 
-pub fn build_transcript(entries: &[SubtitleEntry]) -> String {
-    entries
-        .iter()
-        .map(|e| {
-            let start = time_to_secs(&e.start);
-            let end = time_to_secs(&e.end);
-            format!("[{start:.1}s - {end:.1}s] {}", e.text.trim())
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
 pub fn assess_quality(entries: &[SubtitleEntry]) -> SubtitleQuality {
     let leaked_prompt = entries.iter().any(|entry| {
         let text = entry.text.replace(['，', ',', '。', ' '], "");
@@ -242,8 +232,8 @@ pub fn assess_quality(entries: &[SubtitleEntry]) -> SubtitleQuality {
             (-0.2..=2.6).contains(&gap)
                 && brief(&pair[0])
                 && brief(&pair[1])
-                && ocr_texts_match(&pair[0].text, &pair[1].text)
-                && normalize_ocr_text(&pair[0].text) != normalize_ocr_text(&pair[1].text)
+                && cue_texts_match(&pair[0].text, &pair[1].text)
+                && normalize_cue_text(&pair[0].text) != normalize_cue_text(&pair[1].text)
         })
         .count();
     if entries.len() > 1 && adjacent as f64 / (entries.len() - 1) as f64 > 0.12 {
@@ -287,120 +277,18 @@ fn is_unexpected_script(character: char) -> bool {
     matches!(character as u32, 0x0400..=0x052F | 0x0600..=0x06FF | 0x0750..=0x077F)
 }
 
-/// Assemble sampled OCR frames into dialogue cues.
-///
-/// This only merges repeated samples and removes logos or credit rolls.
-/// Character correction is a later local-model pass, not a fixed word list.
-/// Platform and embedded subtitles must not pass through this function.
-pub fn clean_ocr_entries(entries: &[SubtitleEntry]) -> Vec<SubtitleEntry> {
-    let collapsed = entries
-        .iter()
-        .filter_map(|entry| {
-            let text = strip_mixed_visual_overlay(&collapse_repeated_phrase(entry.text.trim()));
-            (!text.is_empty()).then(|| SubtitleEntry {
-                index: entry.index,
-                start: entry.start.clone(),
-                end: entry.end.clone(),
-                text,
-            })
-        })
-        .collect::<Vec<_>>();
-    // Detect a dense credit tail before fuzzy merging: consecutive cast names
-    // often differ by only one character and would otherwise collapse into a
-    // single cue, hiding the roll from the tail classifier.
-    let pretrimmed = trim_ocr_overlays(&collapsed);
-    let merged = merge_similar_ocr_cues(&pretrimmed);
-    reindex_entries(trim_ocr_overlays(&merged))
+fn is_disposable_overlay(text: &str) -> bool {
+    is_visual_overlay(text) || is_credit_line(text)
 }
 
-/// OCR occasionally joins a large all-caps shop/logo line to the actual Chinese
-/// subtitle.  Keep the dialogue half instead of either feeding the logo to the
-/// director or dropping the whole cue.  This is deliberately conservative: the
-/// removable side must contain at least five Latin letters and be mostly upper
-/// case, while the retained side must contain at least four East-Asian glyphs.
-fn strip_mixed_visual_overlay(text: &str) -> String {
-    let chars = text.char_indices().collect::<Vec<_>>();
-    let first_east_asian = chars
-        .iter()
-        .find_map(|(offset, character)| is_east_asian(*character).then_some(*offset));
-    let last_east_asian_end = chars.iter().rev().find_map(|(offset, character)| {
-        is_east_asian(*character).then_some(*offset + character.len_utf8())
-    });
-
-    let looks_like_visual_label = |value: &str| {
-        let latin = value
-            .chars()
-            .filter(|character| character.is_ascii_alphabetic())
-            .count();
-        let uppercase = value
-            .chars()
-            .filter(|character| character.is_ascii_uppercase())
-            .count();
-        latin >= 5 && uppercase * 4 >= latin * 3
-    };
-    let east_asian_count = text
-        .chars()
-        .filter(|character| is_east_asian(*character))
-        .count();
-    if east_asian_count < 4 {
-        return text.trim().to_string();
-    }
-
-    let mut start = 0;
-    let mut end = text.len();
-    if let Some(first) = first_east_asian {
-        if looks_like_visual_label(&text[..first]) {
-            start = first;
-        }
-    }
-    if let Some(last) = last_east_asian_end {
-        if last >= start && looks_like_visual_label(&text[last..]) {
-            end = last;
-        }
-    }
-    text[start..end].trim().to_string()
-}
-
-fn collapse_repeated_phrase(text: &str) -> String {
-    let parts = text
-        .split_whitespace()
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>();
-    if parts.len() == 2 && normalize_ocr_text(parts[0]) == normalize_ocr_text(parts[1]) {
-        return parts[0].to_string();
-    }
-    text.to_string()
-}
-
-pub(crate) fn ocr_edit_is_conservative(original: &str, corrected: &str) -> bool {
-    let left = normalize_ocr_text(original);
-    let right = normalize_ocr_text(corrected);
-    if left == right {
-        return !right.is_empty() || left.is_empty();
-    }
-    if right.chars().count() < 2 {
-        return false;
-    }
-    let distance = ocr_edit_distance(&left, &right);
-    let longest = left.chars().count().max(right.chars().count());
-    if longest <= 12 {
-        return distance <= 2;
-    }
-    distance <= 6 && distance * 4 <= longest
-}
-
-pub(crate) fn is_disposable_overlay(text: &str) -> bool {
-    is_ocr_overlay(text) || is_credit_line(text)
-}
-
-fn normalize_ocr_text(text: &str) -> String {
+fn normalize_cue_text(text: &str) -> String {
     text.chars()
         .filter(|character| is_east_asian(*character) || character.is_ascii_alphanumeric())
         .flat_map(|character| character.to_lowercase())
         .collect()
 }
 
-fn ocr_edit_distance(left: &str, right: &str) -> usize {
+fn edit_distance(left: &str, right: &str) -> usize {
     let left: Vec<char> = left.chars().collect();
     let right: Vec<char> = right.chars().collect();
     let mut previous: Vec<usize> = (0..=right.len()).collect();
@@ -418,9 +306,9 @@ fn ocr_edit_distance(left: &str, right: &str) -> usize {
     previous[right.len()]
 }
 
-fn ocr_texts_match(left: &str, right: &str) -> bool {
-    let left = normalize_ocr_text(left);
-    let right = normalize_ocr_text(right);
+fn cue_texts_match(left: &str, right: &str) -> bool {
+    let left = normalize_cue_text(left);
+    let right = normalize_cue_text(right);
     if left.is_empty() || right.is_empty() {
         return false;
     }
@@ -431,52 +319,14 @@ fn ocr_texts_match(left: &str, right: &str) -> bool {
     if longest <= 2 {
         return false;
     }
-    let distance = ocr_edit_distance(&left, &right);
+    let distance = edit_distance(&left, &right);
     if longest <= 12 {
         return distance <= 1;
     }
     distance * 3 <= longest
 }
 
-fn merge_similar_ocr_cues(entries: &[SubtitleEntry]) -> Vec<SubtitleEntry> {
-    let mut clusters: Vec<Vec<SubtitleEntry>> = Vec::new();
-    for entry in entries {
-        let can_extend = clusters.last().is_some_and(|cluster| {
-            let active = cluster.last().expect("cluster is not empty");
-            let gap = time_to_secs(&entry.start) - time_to_secs(&active.end);
-            (-0.2..=2.6).contains(&gap) && ocr_texts_match(&active.text, &entry.text)
-        });
-        if can_extend {
-            clusters
-                .last_mut()
-                .expect("cluster exists")
-                .push(entry.clone());
-        } else {
-            clusters.push(vec![entry.clone()]);
-        }
-    }
-    clusters.into_iter().filter_map(vote_text_cluster).collect()
-}
-
-fn vote_text_cluster(cluster: Vec<SubtitleEntry>) -> Option<SubtitleEntry> {
-    let mut counts: HashMap<String, (usize, usize, String)> = HashMap::new();
-    for (offset, entry) in cluster.iter().enumerate() {
-        let key = normalize_ocr_text(&entry.text);
-        let record = counts.entry(key).or_insert((0, offset, entry.text.clone()));
-        record.0 += 1;
-        record.1 = offset;
-        record.2 = entry.text.clone();
-    }
-    let winner = counts
-        .into_values()
-        .max_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)))?;
-    let mut chosen = cluster.first()?.clone();
-    chosen.text = winner.2;
-    chosen.end = cluster.last()?.end.clone();
-    Some(chosen)
-}
-
-fn is_ocr_overlay(text: &str) -> bool {
+fn is_visual_overlay(text: &str) -> bool {
     let east_asian = text
         .chars()
         .filter(|character| is_east_asian(*character))
@@ -502,490 +352,140 @@ fn is_credit_line(text: &str) -> bool {
         .chars()
         .filter(|character| character.is_ascii_uppercase())
         .count();
-    is_ocr_overlay(text) && (text.contains('-') || uppercase >= 4)
+    is_visual_overlay(text) && (text.contains('-') || uppercase >= 4)
 }
 
-fn trim_ocr_overlays(entries: &[SubtitleEntry]) -> Vec<SubtitleEntry> {
-    let dialogue_start = entries
-        .iter()
-        .position(|entry| !is_ocr_overlay(&entry.text) || time_to_secs(&entry.start) > 180.0)
-        .unwrap_or(entries.len());
-    let mut kept = entries[dialogue_start..].to_vec();
-    let end_time = kept
-        .last()
-        .map(|entry| time_to_secs(&entry.end))
-        .unwrap_or(0.0);
-    let credit_roll = kept.iter().enumerate().skip(1).find(|(index, entry)| {
-        let previous_end = time_to_secs(&kept[index - 1].end);
-        let gap = time_to_secs(&entry.start) - previous_end;
-        time_to_secs(&entry.start) >= end_time * 0.8
-            && gap >= 15.0
-            && is_credit_line(&entry.text)
-            && kept.len() - index >= 4
-    });
-    if let Some((index, _)) = credit_roll {
-        kept.truncate(index);
-        return kept;
-    }
+pub fn detect_excluded_ranges(
+    entries: &[SubtitleEntry],
+    duration: f64,
+    skip_intro_outro: bool,
+    skip_ads: bool,
+) -> Vec<ExcludedRange> {
+    let mut ranges = Vec::new();
+    if skip_intro_outro && duration >= 1_200.0 {
+        let intro_markers: Vec<&SubtitleEntry> = entries
+            .iter()
+            .filter(|entry| time_to_secs(&entry.start) <= 180.0 && is_intro_marker(&entry.text))
+            .collect();
+        let intro_end = intro_markers
+            .iter()
+            .map(|entry| time_to_secs(&entry.end) + 4.0)
+            .chain(entries.windows(2).filter_map(|pair| {
+                let left = pair[0].text.trim().to_lowercase();
+                let right = pair[1].text.trim().to_lowercase();
+                let end = time_to_secs(&pair[1].end);
+                (end <= 180.0 && left.len() >= 6 && left == right).then_some(end + 2.0)
+            }))
+            .fold(60.0_f64, f64::max)
+            .clamp(30.0, 180.0);
+        ranges.push(ExcludedRange {
+            start: 0.0,
+            end: intro_end,
+            kind: "片头".into(),
+        });
 
-    // Credit rolls do not always begin after a clean gap and many names are not
-    // all-caps.  Near the end of a feature, classify a sustained Latin-heavy
-    // window as credits, but never use a single foreign sign as the boundary.
-    if let Some(index) = dense_credit_roll_start(&kept, end_time) {
-        kept.truncate(index);
-    }
-    kept
-}
-
-fn dense_credit_roll_start(entries: &[SubtitleEntry], end_time: f64) -> Option<usize> {
-    if entries.len() < 8 || end_time <= 0.0 {
-        return None;
-    }
-    let window = 10usize;
-    for index in 0..entries.len().saturating_sub(7) {
-        if time_to_secs(&entries[index].start) < end_time * 0.80 {
-            continue;
-        }
-        let sample = &entries[index..(index + window).min(entries.len())];
-        if sample.len() < 8 {
-            continue;
-        }
-        let credit_like = sample
+        let outro_search_start = (duration - 240.0).max(duration * 0.7);
+        let marker_start = entries
             .iter()
             .filter(|entry| {
-                let east_asian = entry.text.chars().filter(|c| is_east_asian(*c)).count();
-                let latin = entry
-                    .text
-                    .chars()
-                    .filter(|c| c.is_ascii_alphabetic())
-                    .count();
-                is_credit_line(&entry.text) || (east_asian == 0 && latin >= 4)
+                time_to_secs(&entry.start) >= outro_search_start && is_outro_marker(&entry.text)
             })
-            .count();
-        if credit_like * 10 >= sample.len() * 7 {
-            return Some(index);
-        }
+            .map(|entry| time_to_secs(&entry.start))
+            .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        ranges.push(ExcludedRange {
+            start: marker_start.unwrap_or((duration - 90.0).max(0.0)),
+            end: duration,
+            kind: "片尾".into(),
+        });
     }
-    None
-}
 
-#[derive(Debug, Deserialize)]
-struct OcrAltJson {
-    text: String,
-    confidence: f32,
-}
-
-#[derive(Debug, Deserialize)]
-struct OcrLineJson {
-    #[serde(default)]
-    x: f32,
-    #[serde(default)]
-    y: f32,
-    #[serde(default)]
-    w: f32,
-    #[serde(default)]
-    h: f32,
-    #[serde(default)]
-    candidates: Vec<OcrAltJson>,
-}
-
-#[derive(Debug, Deserialize)]
-struct OcrObservationJson {
-    t: f64,
-    #[serde(default)]
-    text: String,
-    #[serde(default)]
-    confidence: f32,
-    #[serde(default)]
-    x: f32,
-    #[serde(default)]
-    y: f32,
-    #[serde(default)]
-    w: f32,
-    #[serde(default)]
-    h: f32,
-    #[serde(default)]
-    alts: Vec<OcrAltJson>,
-    #[serde(default)]
-    lines: Vec<OcrLineJson>,
-}
-
-struct ResolvedFrame {
-    t: f64,
-    /// Each inner list is one visual line. Every candidate from that line is kept
-    /// so later frames can outvote a weak first choice.
-    line_candidates: Vec<Vec<(String, f32)>>,
-    x: f32,
-    y: f32,
-    w: f32,
-    h: f32,
-}
-
-pub fn ocr_observations_path(srt: &std::path::Path) -> std::path::PathBuf {
-    srt.with_extension("observations.json")
-}
-
-pub fn entries_from_ocr_observations(
-    raw: &str,
-    interval: f64,
-) -> Result<Vec<SubtitleEntry>, String> {
-    let frames: Vec<OcrObservationJson> =
-        serde_json::from_str(raw).map_err(|error| format!("无法解析画面采样：{error}"))?;
-    Ok(vote_ocr_frames(&frames, interval))
-}
-
-struct OpenTrack {
-    segments: Vec<Vec<ResolvedFrame>>,
-    last_t: f64,
-    last_text: String,
-    x: f32,
-    y: f32,
-    w: f32,
-    h: f32,
-}
-
-fn vote_ocr_frames(frames: &[OcrObservationJson], interval: f64) -> Vec<SubtitleEntry> {
-    let mut atoms = Vec::new();
-    for frame in frames {
-        atoms.extend(atoms_from_observation(frame));
-    }
-    atoms.retain(|atom| in_subtitle_band_box(atom.y, atom.h) && !preview_text(atom).is_empty());
-    atoms.sort_by(|left, right| {
-        left.t
-            .partial_cmp(&right.t)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(
-                left.x
-                    .partial_cmp(&right.x)
-                    .unwrap_or(std::cmp::Ordering::Equal),
-            )
-    });
-
-    let sample = interval.max(0.5);
-    let mut tracks: Vec<OpenTrack> = Vec::new();
-    for atom in atoms {
-        let preview = preview_text(&atom);
-        let track_index = tracks
-            .iter()
-            .enumerate()
-            .filter_map(|(index, track)| {
-                let gap = atom.t - track.last_t;
-                if gap < -0.05 || gap > sample * 2.25 {
-                    return None;
-                }
-                let missed = if gap <= sample * 1.25 {
-                    0
-                } else {
-                    ((gap / sample).round() as u32).saturating_sub(1)
-                };
-                if missed >= 2 || !track_matches(track, &atom) {
-                    return None;
-                }
-                Some((index, (track.y - atom.y).abs()))
-            })
-            .min_by(|left, right| {
-                left.1
-                    .partial_cmp(&right.1)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .map(|(index, _)| index);
-
-        if let Some(index) = track_index {
-            let track = &mut tracks[index];
-            if ocr_texts_match(&track.last_text, &preview) {
-                track
-                    .segments
-                    .last_mut()
-                    .expect("track has a segment")
-                    .push(atom);
-            } else {
-                track.segments.push(vec![atom]);
-            }
-            let current = track.segments.last().expect("segment exists");
-            let latest = current.last().expect("segment is not empty");
-            track.last_t = latest.t;
-            track.last_text = preview_text(latest);
-            track.x = latest.x;
-            track.y = latest.y;
-            track.w = latest.w;
-            track.h = latest.h;
-        } else {
-            tracks.push(OpenTrack {
-                last_t: atom.t,
-                last_text: preview,
-                x: atom.x,
-                y: atom.y,
-                w: atom.w,
-                h: atom.h,
-                segments: vec![vec![atom]],
+    if skip_ads {
+        for entry in entries.iter().filter(|entry| is_ad_marker(&entry.text)) {
+            ranges.push(ExcludedRange {
+                start: (time_to_secs(&entry.start) - 3.0).max(0.0),
+                end: (time_to_secs(&entry.end) + 5.0).min(duration),
+                kind: "广告".into(),
             });
         }
     }
-
-    let entries = tracks
-        .into_iter()
-        .filter(|track| !track_is_watermark(track))
-        .flat_map(|track| track.segments)
-        .filter_map(|segment| vote_frame_cluster(&segment, interval))
-        .collect::<Vec<_>>();
-    reindex_entries(trim_ocr_overlays(&entries))
+    merge_ranges(ranges)
 }
 
-fn atoms_from_observation(frame: &OcrObservationJson) -> Vec<ResolvedFrame> {
-    if !frame.lines.is_empty() {
-        return group_stacked_lines(&frame.lines)
-            .into_iter()
-            .filter_map(|group| resolved_from_lines(frame.t, &group))
-            .collect();
-    }
-    if frame.text.trim().is_empty() {
-        return Vec::new();
-    }
-    let mut candidates = vec![(frame.text.trim().to_string(), frame.confidence)];
-    for alternate in &frame.alts {
-        let alternate_text = alternate.text.trim();
-        if alternate_text.is_empty() {
-            continue;
-        }
-        let primary_len = normalize_ocr_text(&frame.text).chars().count();
-        let alternate_len = normalize_ocr_text(alternate_text).chars().count();
-        if primary_len.abs_diff(alternate_len) <= 2 {
-            candidates.push((alternate_text.to_string(), alternate.confidence));
-        }
-    }
-    vec![ResolvedFrame {
-        t: frame.t,
-        line_candidates: vec![candidates],
-        x: frame.x,
-        y: frame.y,
-        w: frame.w,
-        h: frame.h,
-    }]
+fn is_intro_marker(text: &str) -> bool {
+    let normalized = text.to_lowercase();
+    [
+        "片头曲",
+        "主题曲",
+        "主题歌",
+        "作词",
+        "作曲",
+        "演唱",
+        "领衔主演",
+        "♪",
+        "♫",
+    ]
+    .iter()
+    .any(|keyword| normalized.contains(keyword))
 }
 
-fn group_stacked_lines(lines: &[OcrLineJson]) -> Vec<Vec<&OcrLineJson>> {
-    let mut ordered = lines.iter().collect::<Vec<_>>();
-    ordered.sort_by(|left, right| {
-        left.y
-            .partial_cmp(&right.y)
+fn is_outro_marker(text: &str) -> bool {
+    let normalized = text.to_lowercase();
+    [
+        "片尾曲",
+        "下集预告",
+        "演职员",
+        "鸣谢",
+        "制作人员",
+        "本集完",
+        "未完待续",
+        "♪",
+        "♫",
+    ]
+    .iter()
+    .any(|keyword| normalized.contains(keyword))
+}
+
+fn is_ad_marker(text: &str) -> bool {
+    let normalized = text.to_lowercase().replace(' ', "");
+    [
+        "本节目由",
+        "广告之后",
+        "马上回来",
+        "扫描二维码",
+        "扫码下载",
+        "点击下载",
+        "立即下载",
+        "打开app",
+        "下载app",
+        "会员专享",
+        "开通会员",
+        "赞助播出",
+        "品牌赞助",
+        "购买链接",
+        "关注公众号",
+        "长按识别",
+    ]
+    .iter()
+    .any(|keyword| normalized.contains(keyword))
+}
+
+fn merge_ranges(mut ranges: Vec<ExcludedRange>) -> Vec<ExcludedRange> {
+    ranges.sort_by(|a, b| {
+        a.start
+            .partial_cmp(&b.start)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-    let mut groups: Vec<Vec<&OcrLineJson>> = Vec::new();
-    for line in ordered {
-        if let Some(group) = groups.iter_mut().find(|group| {
-            group
-                .iter()
-                .any(|existing| lines_are_stacked(existing, line))
-        }) {
-            group.push(line);
-        } else {
-            groups.push(vec![line]);
-        }
-    }
-    groups
-}
-
-fn lines_are_stacked(left: &OcrLineJson, right: &OcrLineJson) -> bool {
-    if left.w <= 0.0 || right.w <= 0.0 || left.h <= 0.0 || right.h <= 0.0 {
-        return true;
-    }
-    let y_delta = (left.y + left.h / 2.0) - (right.y + right.h / 2.0);
-    let x_delta = (left.x + left.w / 2.0) - (right.x + right.w / 2.0);
-    y_delta.abs() <= 0.08 && x_delta.abs() <= 0.22
-}
-
-fn resolved_from_lines(time: f64, lines: &[&OcrLineJson]) -> Option<ResolvedFrame> {
-    let mut line_candidates = Vec::new();
-    let mut box_left = f32::MAX;
-    let mut box_right = 0.0_f32;
-    let mut box_bottom = f32::MAX;
-    let mut box_top = 0.0_f32;
-    for line in lines {
-        let candidates = line
-            .candidates
-            .iter()
-            .filter(|candidate| !candidate.text.trim().is_empty())
-            .map(|candidate| (candidate.text.trim().to_string(), candidate.confidence))
-            .collect::<Vec<_>>();
-        if candidates.is_empty() {
-            continue;
-        }
-        line_candidates.push(candidates);
-        if line.w > 0.0 && line.h > 0.0 {
-            box_left = box_left.min(line.x);
-            box_right = box_right.max(line.x + line.w);
-            box_bottom = box_bottom.min(line.y);
-            box_top = box_top.max(line.y + line.h);
-        }
-    }
-    if line_candidates.is_empty() {
-        return None;
-    }
-    Some(ResolvedFrame {
-        t: time,
-        line_candidates,
-        x: if box_left == f32::MAX { 0.0 } else { box_left },
-        y: if box_bottom == f32::MAX {
-            0.0
-        } else {
-            box_bottom
-        },
-        w: if box_left == f32::MAX {
-            0.0
-        } else {
-            box_right - box_left
-        },
-        h: if box_bottom == f32::MAX {
-            0.0
-        } else {
-            box_top - box_bottom
-        },
-    })
-}
-
-fn preview_text(frame: &ResolvedFrame) -> String {
-    frame
-        .line_candidates
-        .iter()
-        .filter_map(|candidates| {
-            candidates.iter().max_by(|left, right| {
-                left.1
-                    .partial_cmp(&right.1)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-        })
-        .map(|(text, _)| text.as_str())
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn track_matches(track: &OpenTrack, atom: &ResolvedFrame) -> bool {
-    same_resolved_band(
-        &ResolvedFrame {
-            t: track.last_t,
-            line_candidates: Vec::new(),
-            x: track.x,
-            y: track.y,
-            w: track.w,
-            h: track.h,
-        },
-        atom,
-    )
-}
-
-fn track_is_watermark(track: &OpenTrack) -> bool {
-    let mut texts = std::collections::HashSet::new();
-    let mut count = 0_usize;
-    let mut first = f64::MAX;
-    let mut last = 0.0_f64;
-    for segment in &track.segments {
-        for frame in segment {
-            texts.insert(normalize_ocr_text(&preview_text(frame)));
-            count += 1;
-            first = first.min(frame.t);
-            last = last.max(frame.t);
-        }
-    }
-    texts.len() == 1 && count >= 8 && last - first >= 20.0
-}
-
-fn in_subtitle_band_box(y: f32, h: f32) -> bool {
-    if h <= 0.0 {
-        return true;
-    }
-    y + h / 2.0 <= 0.28
-}
-
-fn same_resolved_band(left: &ResolvedFrame, right: &ResolvedFrame) -> bool {
-    if left.w <= 0.0 || right.w <= 0.0 || left.h <= 0.0 || right.h <= 0.0 {
-        return true;
-    }
-    let y_delta = (left.y - right.y).abs();
-    let height_ratio = left.h.max(right.h) / left.h.min(right.h).max(0.001);
-    let overlap = (left.x + left.w).min(right.x + right.w) - left.x.max(right.x);
-    y_delta <= 0.06 && height_ratio <= 1.8 && overlap > 0.0
-}
-
-fn vote_frame_cluster(cluster: &[ResolvedFrame], interval: f64) -> Option<SubtitleEntry> {
-    let line_count = cluster
-        .iter()
-        .map(|frame| frame.line_candidates.len())
-        .max()
-        .unwrap_or(0);
-    let mut parts = Vec::new();
-    for index in 0..line_count {
-        let mut scores: HashMap<String, (f32, String)> = HashMap::new();
-        for frame in cluster {
-            let Some(candidates) = frame.line_candidates.get(index) else {
+    let mut merged: Vec<ExcludedRange> = Vec::new();
+    for range in ranges {
+        if let Some(previous) = merged.last_mut() {
+            if range.start <= previous.end + 5.0 && range.kind == previous.kind {
+                previous.end = previous.end.max(range.end);
                 continue;
-            };
-            for (text, confidence) in candidates {
-                let key = normalize_ocr_text(text);
-                if key.is_empty() {
-                    continue;
-                }
-                let record = scores.entry(key).or_insert((0.0, text.clone()));
-                record.0 += confidence;
             }
         }
-        let winner = scores.into_values().max_by(|left, right| {
-            left.0
-                .partial_cmp(&right.0)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })?;
-        parts.push(winner.1);
+        merged.push(range);
     }
-    if parts.is_empty() {
-        return None;
-    }
-    let start = cluster.first()?.t;
-    let end = cluster.last()?.t + interval.max(0.4);
-    Some(SubtitleEntry {
-        index: 1,
-        start: secs_to_time(start),
-        end: secs_to_time(end),
-        text: parts.join(" "),
-    })
-}
-
-fn reindex_entries(entries: Vec<SubtitleEntry>) -> Vec<SubtitleEntry> {
-    entries
-        .into_iter()
-        .enumerate()
-        .map(|(offset, mut entry)| {
-            entry.index = offset as u32 + 1;
-            entry
-        })
-        .collect()
-}
-
-pub fn compact_transcript(entries: &[SubtitleEntry], max_chars: usize) -> String {
-    let full = build_transcript(entries);
-    if full.len() <= max_chars {
-        return full;
-    }
-    if entries.is_empty() {
-        return full.chars().take(max_chars).collect();
-    }
-    let mut step = full.len().div_ceil(max_chars.max(1)).max(2);
-    while step <= entries.len().max(1) {
-        let sampled = entries
-            .iter()
-            .enumerate()
-            .filter(|(index, _)| index % step == 0 || *index == entries.len() - 1)
-            .map(|(_, entry)| {
-                let start = time_to_secs(&entry.start);
-                let end = time_to_secs(&entry.end);
-                format!("[{start:.1}s - {end:.1}s] {}", entry.text.trim())
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        if sampled.len() <= max_chars {
-            return sampled;
-        }
-        step += 1;
-    }
-    full.chars().take(max_chars).collect()
+    merged
 }
 
 #[cfg(test)]
@@ -998,23 +498,6 @@ mod tests {
         let entries = parse_srt(srt).unwrap();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].text, "Hello world");
-    }
-
-    #[test]
-    fn compact_transcript_samples_across_the_whole_transcript() {
-        let entries = (0..1_200)
-            .map(|index| SubtitleEntry {
-                index,
-                start: secs_to_time(index as f64 * 2.0),
-                end: secs_to_time(index as f64 * 2.0 + 1.5),
-                text: format!("第{index}条字幕包含人物行动、阻力和结果，用于覆盖完整剧情。"),
-            })
-            .collect::<Vec<_>>();
-        let compact = compact_transcript(&entries, 60_000);
-        assert!(compact.len() <= 60_000);
-        assert!(compact.lines().count() > 100);
-        assert!(compact.contains("第0条字幕"));
-        assert!(compact.contains("第1199条字幕"));
     }
 
     #[test]
@@ -1058,217 +541,6 @@ mod tests {
         assert!(quality.score < 60);
     }
 
-    fn cue(start: f64, end: f64, text: &str) -> SubtitleEntry {
-        SubtitleEntry {
-            index: 1,
-            start: secs_to_time(start),
-            end: secs_to_time(end),
-            text: text.to_string(),
-        }
-    }
-
-    #[test]
-    fn ocr_clean_merges_lookalike_frames_and_drops_overlays() {
-        let entries = vec![
-            cue(2.25, 3.0, "TUCK"),
-            cue(3.0, 7.5, "TUCKER FILM"),
-            cue(72.0, 77.25, "孩提时感受到的冬季 并没有这么寒冷"),
-            cue(1760.25, 1761.0, "入验的时候"),
-            cue(1761.0, 1761.75, "入殓的时候"),
-            cue(1872.5, 1873.25, "霝要细致地进行"),
-            cue(1875.5, 1876.25, "需要细致地进行"),
-            cue(7145.25, 7146.0, "我丈夫是入殓师"),
-            cue(7147.5, 7151.25, "我文夫是入殓师"),
-            cue(7464.25, 7465.0, "老爸"),
-            cue(7588.5, 7589.25, "Daigo KOBAYASHI - Masahiro MOTOKI"),
-            cue(7590.0, 7593.0, "本木雅弘 Daigo KOBAYASHI -Masahiro MOTOKI"),
-            cue(7593.75, 7594.5, "Mika KOBAYASHI - RyOKO HIROSUE"),
-            cue(7595.0, 7596.0, "Yuriko UEMURA - Kimiko YO"),
-            cue(7596.5, 7597.5, "TSUYAKO YAMASHITA - Kazuko YOSHIYUKI"),
-            cue(7598.0, 7599.0, "SHOHEI SASAKI - Tsutomu YAMAZAKI"),
-            cue(7599.5, 7600.5, "监督 滝田洋二郎"),
-            cue(7601.0, 7602.0, "Regia: Yojiro TAKITA"),
-        ];
-        let cleaned = clean_ocr_entries(&entries);
-        let text = cleaned
-            .iter()
-            .map(|entry| entry.text.as_str())
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(!text.contains("TUCKER"));
-        assert!(!text.contains("Daigo"));
-        assert!(text.contains("孩提时感受到的冬季"));
-        assert!(text.contains("老爸"));
-        assert_eq!(
-            text.lines().filter(|line| line.contains("的时候")).count(),
-            1
-        );
-        assert_eq!(
-            text.lines()
-                .filter(|line| line.contains("细致地进行"))
-                .count(),
-            1
-        );
-        assert_eq!(
-            text.lines().filter(|line| line.contains("入殓师")).count(),
-            1,
-            "the two husband readings must collapse to one cue; confidence, not order, decides the character"
-        );
-    }
-
-    #[test]
-    fn ocr_clean_separates_visual_labels_from_dialogue() {
-        let entries = vec![
-            cue(10.0, 12.0, "SNACK PUB ARMONIA 两年前去世的母亲留给我的房子"),
-            cue(14.0, 16.0, "不会整理得这么干净了 CERTS"),
-        ];
-        let cleaned = clean_ocr_entries(&entries);
-        assert_eq!(cleaned[0].text, "两年前去世的母亲留给我的房子");
-        assert_eq!(cleaned[1].text, "不会整理得这么干净了");
-    }
-
-    #[test]
-    fn dense_latin_tail_is_classified_as_credit_roll() {
-        let mut entries = vec![cue(10.0, 12.0, "故事仍在继续")];
-        for index in 0..10 {
-            entries.push(cue(
-                90.0 + index as f64,
-                90.8 + index as f64,
-                &format!("CAST MEMBER {index}"),
-            ));
-        }
-        let cleaned = clean_ocr_entries(&entries);
-        assert_eq!(cleaned.len(), 1);
-        assert_eq!(cleaned[0].text, "故事仍在继续");
-    }
-
-    #[test]
-    fn observation_vote_prefers_repeated_high_confidence_reading() {
-        let raw = r#"[
-            {"t":29.25,"text":"入验的时候","confidence":0.72},
-            {"t":30.0,"text":"入殓的时候","confidence":0.84},
-            {"t":30.75,"text":"入殓的时候","confidence":0.89},
-            {"t":31.5,"text":"入殓的时候","confidence":0.87},
-            {"t":100.0,"text":"我丈夫是入殓师","confidence":0.91,"x":0.31,"y":0.05,"w":0.38,"h":0.06},
-            {"t":100.75,"text":"我文夫是入殓师","confidence":0.62,"x":0.31,"y":0.05,"w":0.38,"h":0.06},
-            {"t":101.5,"text":"我文夫是入殓师","confidence":0.9,"x":0.2,"y":0.72,"w":0.4,"h":0.05}
-        ]"#;
-        let entries = entries_from_ocr_observations(raw, 0.75).unwrap();
-        let text = entries
-            .iter()
-            .map(|entry| entry.text.as_str())
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert_eq!(text.matches("入殓的时候").count(), 1);
-        assert!(!text.contains("入验"));
-        assert!(text.contains("我丈夫是入殓师"));
-        assert!(!text.contains("文夫"));
-    }
-
-    #[test]
-    fn blank_frame_splits_repeated_dialogue() {
-        let raw = r#"[
-            {"t":10.5,"text":"我知道了","confidence":0.9},
-            {"t":11.25,"text":"我知道了","confidence":0.9},
-            {"t":12.0,"text":"","confidence":0},
-            {"t":12.75,"text":"","confidence":0},
-            {"t":13.5,"text":"我知道了","confidence":0.9}
-        ]"#;
-        let entries = entries_from_ocr_observations(raw, 0.75).unwrap();
-        assert_eq!(entries.len(), 2);
-        assert!(entries.iter().all(|entry| entry.text == "我知道了"));
-    }
-
-    #[test]
-    fn second_choice_can_win_across_frames() {
-        let raw = r#"[
-            {"t":1.0,"lines":[{"x":0.3,"y":0.05,"w":0.3,"h":0.05,"candidates":[
-                {"text":"入验的时候","confidence":0.62},
-                {"text":"入殓的时候","confidence":0.60}
-            ]}]},
-            {"t":1.75,"lines":[{"x":0.3,"y":0.05,"w":0.3,"h":0.05,"candidates":[
-                {"text":"入验的时候","confidence":0.63},
-                {"text":"入殓的时候","confidence":0.61}
-            ]}]},
-            {"t":2.5,"lines":[{"x":0.3,"y":0.05,"w":0.3,"h":0.05,"candidates":[
-                {"text":"入验的时候","confidence":0.40},
-                {"text":"入殓的时候","confidence":0.95}
-            ]}]}
-        ]"#;
-        let entries = entries_from_ocr_observations(raw, 0.75).unwrap();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].text, "入殓的时候");
-    }
-
-    #[test]
-    fn watermark_stays_off_the_dialogue_line() {
-        let raw = r#"[
-            {"t":1.0,"lines":[
-                {"x":0.02,"y":0.02,"w":0.12,"h":0.04,"candidates":[{"text":"爱壹帆","confidence":0.95}]},
-                {"x":0.28,"y":0.05,"w":0.46,"h":0.05,"candidates":[{"text":"我今天一定会回来","confidence":0.9}]}
-            ]},
-            {"t":1.75,"lines":[
-                {"x":0.02,"y":0.02,"w":0.12,"h":0.04,"candidates":[{"text":"爱壹帆","confidence":0.95}]},
-                {"x":0.28,"y":0.05,"w":0.46,"h":0.05,"candidates":[{"text":"走吧","confidence":0.9}]}
-            ]}
-        ]"#;
-        let text = entries_from_ocr_observations(raw, 0.75)
-            .unwrap()
-            .into_iter()
-            .map(|entry| entry.text)
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(text.contains("我今天一定会回来"));
-        assert!(text.contains("走吧"));
-        assert!(!text.contains("爱壹帆 我今天"));
-        assert!(!text.contains("爱壹帆 走吧"));
-    }
-
-    #[test]
-    fn one_missed_frame_does_not_split_caption() {
-        let raw = r#"[
-            {"t":10.5,"text":"我知道了","confidence":0.9,"x":0.3,"y":0.05,"w":0.3,"h":0.05},
-            {"t":11.25,"text":"","confidence":0},
-            {"t":12.0,"text":"我知道了","confidence":0.88,"x":0.3,"y":0.05,"w":0.3,"h":0.05}
-        ]"#;
-        let entries = entries_from_ocr_observations(raw, 0.75).unwrap();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].text, "我知道了");
-        assert!(entries[0].end.starts_with("00:00:12"));
-    }
-
-    #[test]
-    fn line_candidate_can_replace_weaker_primary() {
-        let raw = r#"[
-            {"t":1.0,"lines":[{"x":0.3,"y":0.05,"w":0.3,"h":0.05,"candidates":[
-                {"text":"入验的时候","confidence":0.55},
-                {"text":"入殓的时候","confidence":0.95}
-            ]}]}
-        ]"#;
-        let entries = entries_from_ocr_observations(raw, 0.75).unwrap();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].text, "入殓的时候");
-    }
-
-    #[test]
-    fn keeps_english_and_single_cjk_and_kana_dialogue() {
-        let entries = vec![
-            cue(10.0, 12.0, "I love you"),
-            cue(14.0, 17.0, "Where are you going?"),
-            cue(20.0, 21.0, "不"),
-            cue(24.0, 26.0, "ありがとう"),
-        ];
-        let text = clean_ocr_entries(&entries)
-            .into_iter()
-            .map(|entry| entry.text)
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(text.contains("I love you"));
-        assert!(text.contains("Where are you going?"));
-        assert!(text.contains("不"));
-        assert!(text.contains("ありがとう"));
-    }
-
     #[test]
     fn detects_recognition_prompt_leak_even_in_short_subtitles() {
         let entries = vec![SubtitleEntry {
@@ -1280,5 +552,48 @@ mod tests {
         let quality = assess_quality(&entries);
         assert!(quality.needs_retranscription);
         assert!(quality.reasons[0].contains("提示词"));
+    }
+    fn entry(index: u32, start: f64, end: f64, text: &str) -> SubtitleEntry {
+        SubtitleEntry {
+            index,
+            start: secs_to_time(start),
+            end: secs_to_time(end),
+            text: text.into(),
+        }
+    }
+
+    #[test]
+    fn excludes_long_form_intro_outro_and_ads() {
+        let entries = vec![
+            entry(1, 4.0, 8.0, "主题曲 演唱"),
+            entry(2, 600.0, 604.0, "本节目由某品牌赞助播出"),
+            entry(3, 2_520.0, 2_524.0, "下集预告"),
+        ];
+        let ranges = detect_excluded_ranges(&entries, 2_600.0, true, true);
+        assert!(ranges
+            .iter()
+            .any(|range| range.kind == "片头" && range.start == 0.0));
+        assert!(ranges.iter().any(|range| range.kind == "广告"));
+        assert!(ranges
+            .iter()
+            .any(|range| range.kind == "片尾" && range.end == 2_600.0));
+    }
+
+    #[test]
+    fn short_videos_do_not_get_forced_intro_outro_trim() {
+        let entries = vec![entry(1, 0.0, 3.0, "开场")];
+        assert!(detect_excluded_ranges(&entries, 120.0, true, true).is_empty());
+    }
+
+    #[test]
+    fn repeated_early_lyrics_extend_intro_range() {
+        let entries = vec![
+            entry(1, 150.0, 160.0, "O'er the world's great"),
+            entry(2, 160.0, 176.0, "O'er the world's great"),
+            entry(3, 220.0, 224.0, "人物开始对话"),
+        ];
+        let ranges = detect_excluded_ranges(&entries, 2_600.0, true, false);
+        let intro = ranges.iter().find(|range| range.kind == "片头").unwrap();
+        assert!(intro.end >= 178.0);
     }
 }

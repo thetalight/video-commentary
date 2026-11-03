@@ -17,35 +17,35 @@ pub struct AppConfig {
     /// Used when original_audio_mode is duck (e.g. -20).
     #[serde(default = "default_duck_db")]
     pub duck_db: f64,
-    #[serde(default = "default_burn_captions")]
-    pub burn_captions: bool,
-    /// Bottom picture area covered before commentary captions, 0 disables masking.
+    /// Bottom share of the source picture cropped away to hide its burned-in subtitles.
     #[serde(default = "default_source_caption_mask")]
     pub source_caption_mask_percent: u32,
-    #[serde(default = "default_subtitle_font_size")]
-    pub subtitle_font_size: u32,
     /// Optional local music file. Empty keeps music disabled.
     #[serde(default)]
     pub background_music_path: String,
     #[serde(default = "default_background_music_db")]
     pub background_music_db: f64,
-    #[serde(default = "default_target_duration")]
-    pub default_target_duration_secs: u32,
     #[serde(default = "default_style")]
     pub default_style: String,
+    /// Legacy fields retained for old settings only; DeepSeek reads backend .env.
     #[serde(default = "default_ollama_base_url")]
     pub ollama_base_url: String,
-    /// Empty = automatically choose a locally installed model.
+    /// Ignored by AI requests; kept for deserialization compatibility.
     #[serde(default)]
     pub ollama_model: String,
-    /// Optional local multimodal model for rough-cut frames. Empty = auto-detect,
-    /// then fall back to the director model if it also supports images.
-    #[serde(default)]
-    pub ollama_vision_model: String,
     #[serde(default = "default_true")]
     pub skip_intro_outro: bool,
     #[serde(default = "default_true")]
     pub skip_ads: bool,
+    /// 平台字幕与内封字幕都没有时，用本机 whisper 从音轨转写（不联网）。
+    #[serde(default = "default_true")]
+    pub asr_fallback: bool,
+    /// 空 = 自动在 models/ 里挑一个 ggml 模型。
+    #[serde(default)]
+    pub asr_model_path: String,
+    /// 空 = auto（让 whisper 自己判断语种）。
+    #[serde(default)]
+    pub asr_language: String,
 }
 
 fn default_video_quality() -> String {
@@ -57,28 +57,17 @@ fn default_source_caption_mask() -> u32 {
 }
 
 fn default_tts_voice() -> String {
-    "zh-CN-XiaoxiaoNeural".to_string()
+    "Tingting".to_string()
 }
 
 fn default_original_audio_mode() -> String {
-    "mute".to_string()
+    "duck".to_string()
 }
 
 fn default_duck_db() -> f64 {
     -20.0
 }
 
-fn default_burn_captions() -> bool {
-    true
-}
-
-fn default_subtitle_font_size() -> u32 {
-    24
-}
-
-fn default_target_duration() -> u32 {
-    90
-}
 fn default_background_music_db() -> f64 {
     -24.0
 }
@@ -118,18 +107,17 @@ impl Default for AppConfig {
             tts_voice: default_tts_voice(),
             original_audio_mode: default_original_audio_mode(),
             duck_db: default_duck_db(),
-            burn_captions: default_burn_captions(),
             source_caption_mask_percent: default_source_caption_mask(),
-            subtitle_font_size: default_subtitle_font_size(),
             background_music_path: String::new(),
             background_music_db: default_background_music_db(),
-            default_target_duration_secs: default_target_duration(),
             default_style: default_style(),
             ollama_base_url: default_ollama_base_url(),
             ollama_model: String::new(),
-            ollama_vision_model: String::new(),
             skip_intro_outro: true,
             skip_ads: true,
+            asr_fallback: true,
+            asr_model_path: String::new(),
+            asr_language: String::new(),
         }
     }
 }
@@ -154,29 +142,25 @@ pub struct TaskProgress {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TaskCompletePayload {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub task_id: Option<String>,
-    pub output_path: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DependencyStatus {
     pub ytdlp: bool,
     pub ffmpeg: bool,
     pub ffmpeg_burn: bool,
-    pub hard_subtitle_ocr: bool,
-    pub edge_tts: bool,
+    pub local_tts: bool,
+    /// 本机语音转写：whisper-cli 与 ggml 模型是否都就位。
+    #[serde(default)]
+    pub whisper: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub whisper_model: Option<String>,
     pub ytdlp_version: Option<String>,
     pub ffmpeg_version: Option<String>,
     pub ffmpeg_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OllamaStatus {
+pub struct AiStatus {
     pub available: bool,
-    pub base_url: String,
-    pub models: Vec<String>,
+    pub model: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -192,7 +176,6 @@ pub struct ExcludedRange {
 pub struct PrepareResult {
     pub task_id: String,
     pub job_dir: String,
-    pub inbox_dir: String,
     pub source_path: String,
     pub transcript_path: String,
     #[serde(default)]
@@ -203,23 +186,8 @@ pub struct PrepareResult {
     pub subtitle_source: String,
     pub title: String,
     pub duration_secs: f64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub plan: Option<crate::models::edit::EditPlan>,
-    #[serde(default)]
-    pub commentary: String,
-    #[serde(default)]
-    pub waiting_for_director: bool,
     #[serde(default)]
     pub excluded_ranges: Vec<ExcludedRange>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub director_error: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RenderResult {
-    pub task_id: String,
-    pub output_path: String,
-    pub title: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -228,8 +196,6 @@ pub struct ExistingJob {
     pub title: String,
     pub status: String,
     pub prepare: PrepareResult,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub output_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     pub updated_at_ms: u64,
@@ -243,4 +209,8 @@ pub struct ExistingJob {
     pub error_code: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_url: Option<String>,
+    #[serde(default)]
+    pub shorts_total: usize,
+    #[serde(default)]
+    pub shorts_rendered: usize,
 }

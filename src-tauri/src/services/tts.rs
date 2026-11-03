@@ -1,106 +1,122 @@
+//! Offline macOS speech synthesis. Caption boundaries are estimated from the
+//! measured audio duration; no narration text leaves this computer.
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use serde::{Deserialize, Serialize};
+
 #[derive(Debug, thiserror::Error)]
 pub enum TtsError {
-    #[error("TTS 失败: {0}")]
+    #[error("本机配音失败: {0}")]
     Failed(String),
     #[error("IO: {0}")]
     Io(#[from] std::io::Error),
 }
 
-fn command_ok(bin: &str, args: &[&str]) -> bool {
-    Command::new(bin)
-        .args(args)
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+#[derive(Debug, Clone, Serialize)]
+pub struct LocalVoice {
+    pub name: String,
+    pub language: String,
 }
 
-pub fn is_edge_tts_available() -> bool {
-    command_ok("edge-tts", &["--help"]) || command_ok("python3", &["-m", "edge_tts", "--help"])
+pub fn local_voices() -> Vec<LocalVoice> {
+    let Ok(output) = Command::new("say").args(["-v", "?"]).output() else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    let pattern = regex::Regex::new(r"^(.+?)\s{2,}(zh_(?:CN|TW|HK))\s+#").expect("voice regex");
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let captures = pattern.captures(line)?;
+            Some(LocalVoice {
+                name: captures[1].trim().to_string(),
+                language: captures[2].to_string(),
+            })
+        })
+        .collect()
+}
+
+pub fn is_local_tts_available() -> bool {
+    !local_voices().is_empty()
 }
 
 pub fn validate_voice(voice: &str) -> Result<&str, String> {
     let voice = voice.trim();
-    if voice.len() > 100
-        || !voice.starts_with(|c: char| c.is_ascii_alphabetic())
-        || !voice.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+    if local_voices()
+        .iter()
+        .any(|candidate| candidate.name == voice)
     {
-        return Err("请输入有效的 Edge TTS 音色名称，例如 zh-CN-XiaoxiaoNeural".into());
+        Ok(voice)
+    } else {
+        Err(format!(
+            "本机没有「{voice}」中文音色，请从设置中的已安装音色选择"
+        ))
     }
-    Ok(voice)
 }
 
-/// Preview only the selected Edge voice, never the system fallback or its cache.
 pub fn preview_voice(voice: &str) -> Result<PathBuf, TtsError> {
     let voice = validate_voice(voice).map_err(TtsError::Failed)?;
-    let text = "你好，这是电影解说音色试听。同样的一段故事，不同的声音，会带来不同的感受。";
+    let text = "你好，这是电影解说的本机配音试听。同样的一段故事，不同的声音，会带来不同的感受。";
     let root = crate::services::jobs::inbox_root().join(".voice-previews");
     let key =
-        crate::services::jobs::stable_hash(&[b"edge-only-v1", voice.as_bytes(), text.as_bytes()]);
-    let output = root.join(format!("{key}.mp3"));
+        crate::services::jobs::stable_hash(&[b"local-say-v1", voice.as_bytes(), text.as_bytes()]);
+    let output = root.join(format!("{key}.wav"));
     if validate_audio(&output).is_ok() {
         return Ok(output);
     }
     let pending = PendingAudio::new(&root)?;
-    let staged = pending.0.join("preview.mp3");
-    run_edge_tts(text, voice, &staged)?;
+    let staged = pending.0.join("preview.aiff");
+    synthesize(text, voice, &staged)?;
     validate_audio(&staged)?;
-    std::fs::rename(staged, &output)?;
+    let web_audio = pending.0.join("preview.wav");
+    let ffmpeg = crate::services::ffmpeg::resolve_ffmpeg_bin()
+        .ok_or_else(|| TtsError::Failed("未找到可运行的 FFmpeg".into()))?;
+    let result = Command::new(ffmpeg)
+        .arg("-hide_banner")
+        .arg("-loglevel")
+        .arg("error")
+        .arg("-y")
+        .arg("-i")
+        .arg(&staged)
+        .args(["-ac", "1", "-ar", "44100", "-c:a", "pcm_s16le"])
+        .arg(&web_audio)
+        .output()?;
+    if !result.status.success() {
+        return Err(TtsError::Failed(
+            String::from_utf8_lossy(&result.stderr).trim().to_string(),
+        ));
+    }
+    validate_audio(&web_audio)?;
+    std::fs::rename(web_audio, &output)?;
     Ok(output)
 }
 
-fn run_edge_tts(text: &str, voice: &str, output: &Path) -> Result<(), TtsError> {
-    let out = output.to_str().unwrap_or_default();
-    let attempts = [
-        (
-            "edge-tts",
-            vec!["--voice", voice, "--text", text, "--write-media", out],
-        ),
-        (
-            "python3",
-            vec![
-                "-m",
-                "edge_tts",
-                "--voice",
-                voice,
-                "--text",
-                text,
-                "--write-media",
-                out,
-            ],
-        ),
-    ];
-
-    let mut last = String::new();
-    for (bin, args) in attempts {
-        // Each command must produce its own fresh staged result.
-        if Path::new(out).exists() {
-            std::fs::remove_file(out)?;
-        }
-        let output = Command::new(bin).args(&args).output();
-        match output {
-            Ok(o) if o.status.success() => match validate_audio(Path::new(out)) {
-                Ok(()) => return Ok(()),
-                Err(error) => last = format!("{bin} 已结束，但音频校验失败：{error}"),
-            },
-            Ok(o) => {
-                last = format!(
-                    "配音命令失败或输出音频无效：{} {}",
-                    String::from_utf8_lossy(&o.stdout),
-                    String::from_utf8_lossy(&o.stderr)
-                );
-            }
-            Err(e) => last = e.to_string(),
-        }
+fn synthesize(text: &str, voice: &str, output: &Path) -> Result<(), TtsError> {
+    let script = output.with_extension("txt");
+    std::fs::write(&script, text)?;
+    let result = Command::new("say")
+        .arg("-v")
+        .arg(voice)
+        .arg("-o")
+        .arg(output)
+        .arg("-f")
+        .arg(&script)
+        .output()?;
+    let _ = std::fs::remove_file(script);
+    if !result.status.success() {
+        return Err(TtsError::Failed(
+            String::from_utf8_lossy(&result.stderr).trim().to_string(),
+        ));
     }
-    Err(TtsError::Failed(last))
+    Ok(())
 }
 
-fn validate_audio(path: &Path) -> Result<(), TtsError> {
+fn validate_audio(path: &Path) -> Result<f64, TtsError> {
     let metadata = std::fs::metadata(path)?;
     if !metadata.is_file() || metadata.len() == 0 {
         return Err(TtsError::Failed("配音文件为空或不是普通文件".into()));
@@ -110,35 +126,25 @@ fn validate_audio(path: &Path) -> Result<(), TtsError> {
     if !duration.is_finite() || duration <= 0.0 {
         return Err(TtsError::Failed("配音文件没有有效时长".into()));
     }
-    Ok(())
+    Ok(duration)
 }
 
 pub fn cached_or_synthesize(text: &str, voice: &str, output: &Path) -> Result<PathBuf, TtsError> {
-    let target = output.with_extension("mp3");
+    let target = output.with_extension("aiff");
     if validate_audio(&target).is_ok() && read_word_boundaries(&target).is_ok() {
         return Ok(target);
     }
     let voice = validate_voice(voice).map_err(TtsError::Failed)?;
     let pending = PendingAudio::new(output.parent().unwrap_or_else(|| Path::new(".")))?;
-    let staged = pending.0.join("aligned.mp3");
-    let result = Command::new("python3")
-        .args(["-c", include_str!("edge_aligned.py"), text, voice])
-        .arg(&staged)
-        .output()?;
-    if !result.status.success() {
-        return Err(TtsError::Failed(format!(
-            "逐词对齐配音失败：{}；未回退为估算字幕",
-            String::from_utf8_lossy(&result.stderr)
-        )));
+    let staged = pending.0.join("narration.aiff");
+    synthesize(text, voice, &staged)?;
+    let duration = validate_audio(&staged)?;
+    let words = approximate_boundaries(text, duration);
+    if words.is_empty() {
+        return Err(TtsError::Failed("文案没有可配音的文字".into()));
     }
-    validate_audio(&staged)?;
-    let words = read_word_boundaries(&staged)?;
-    let duration = crate::services::ffmpeg::get_duration(&staged)
-        .map_err(|e| TtsError::Failed(e.to_string()))?;
-    if words.last().is_none_or(|w| w.end > duration + 0.1) {
-        return Err(TtsError::Failed("配音词边界超出音频时长".into()));
-    }
-    // Remove the old pair's timing first so an interruption never accepts mismatched metadata.
+    let timing = serde_json::to_vec(&words).map_err(|e| TtsError::Failed(e.to_string()))?;
+    std::fs::write(word_path(&staged), timing)?;
     let sidecar = word_path(&target);
     if sidecar.exists() {
         std::fs::remove_file(&sidecar)?;
@@ -148,15 +154,65 @@ pub fn cached_or_synthesize(text: &str, voice: &str, output: &Path) -> Result<Pa
     Ok(target)
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WordBoundary {
     pub start: f64,
     pub end: f64,
     pub text: String,
 }
+
+fn approximate_boundaries(text: &str, duration: f64) -> Vec<WordBoundary> {
+    let mut tokens: Vec<(String, f64, f64)> = Vec::new();
+    let mut ascii = String::new();
+    let flush_ascii = |ascii: &mut String, tokens: &mut Vec<(String, f64, f64)>| {
+        if !ascii.is_empty() {
+            let weight = (ascii.len() as f64 * 0.55).max(1.0);
+            tokens.push((std::mem::take(ascii), weight, 0.0));
+        }
+    };
+    for ch in text.chars() {
+        if ch.is_ascii_alphanumeric() {
+            ascii.push(ch);
+            continue;
+        }
+        flush_ascii(&mut ascii, &mut tokens);
+        if "，,、；;：:".contains(ch) {
+            if let Some(last) = tokens.last_mut() {
+                last.0.push(ch);
+                last.2 += 0.6;
+            }
+        } else if "。.!！?？…".contains(ch) {
+            if let Some(last) = tokens.last_mut() {
+                last.0.push(ch);
+                last.2 += 1.0;
+            }
+        } else if !ch.is_whitespace() {
+            tokens.push((ch.to_string(), 1.0, 0.0));
+        }
+    }
+    flush_ascii(&mut ascii, &mut tokens);
+    if tokens.is_empty() || !duration.is_finite() || duration <= 0.0 {
+        return Vec::new();
+    }
+    let weight: f64 = tokens.iter().map(|(_, speech, pause)| speech + pause).sum();
+    let lead = duration.min(0.04);
+    let budget = (duration - lead).max(0.0);
+    let mut cursor = lead;
+    tokens
+        .into_iter()
+        .map(|(text, speech, pause)| {
+            let start = cursor;
+            let end = (start + budget * speech / weight).min(duration);
+            cursor = (end + budget * pause / weight).min(duration);
+            WordBoundary { start, end, text }
+        })
+        .collect()
+}
+
 fn word_path(path: &Path) -> PathBuf {
     PathBuf::from(format!("{}.words.json", path.to_string_lossy()))
 }
+
 pub fn read_word_boundaries(audio: &Path) -> Result<Vec<WordBoundary>, TtsError> {
     let words: Vec<WordBoundary> = serde_json::from_slice(&std::fs::read(word_path(audio))?)
         .map_err(|e| TtsError::Failed(e.to_string()))?;
@@ -168,18 +224,16 @@ pub fn read_word_boundaries(audio: &Path) -> Result<Vec<WordBoundary>, TtsError>
             || word.end <= word.start
             || word.text.trim().is_empty()
         {
-            return Err(TtsError::Failed("配音词边界无效".into()));
+            return Err(TtsError::Failed("配音字幕时间轴无效".into()));
         }
         end = word.end;
     }
     if words.is_empty() {
-        return Err(TtsError::Failed("缺少配音词边界".into()));
+        return Err(TtsError::Failed("缺少配音字幕时间轴".into()));
     }
     Ok(words)
 }
 
-// Only our own unique staging directory is cleaned up. Existing cache files
-// are untouched until a replacement has been generated and validated.
 struct PendingAudio(PathBuf);
 
 impl PendingAudio {
@@ -209,26 +263,47 @@ impl Drop for PendingAudio {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
-    fn validates_selected_and_custom_voice_ids() {
+    fn estimated_boundaries_are_ordered_and_cover_the_narration() {
+        let words = approximate_boundaries("他先停下。然后说 Hello。", 6.0);
+        assert!(!words.is_empty());
         assert_eq!(
-            validate_voice(" zh-CN-YunxiNeural ").unwrap(),
-            "zh-CN-YunxiNeural"
+            words
+                .iter()
+                .map(|word| word.text.as_str())
+                .collect::<String>(),
+            "他先停下。然后说Hello。"
         );
-        assert!(validate_voice("en-US-JennyNeural").is_ok());
-        for bad in ["", "--help", "../../secret", "voice\n--text", "voice name"] {
-            assert!(validate_voice(bad).is_err());
+        let mut previous = 0.0;
+        for word in &words {
+            assert!(word.start >= previous);
+            assert!(word.end > word.start);
+            previous = word.end;
         }
+        assert!(words.last().unwrap().end <= 6.0);
     }
 
     #[test]
-    fn empty_mp3_is_rejected_without_probing() {
+    fn no_text_produces_no_boundaries() {
+        assert!(approximate_boundaries("  ，。  ", 3.0).is_empty());
+    }
+
+    #[test]
+    #[ignore]
+    fn local_voice_creates_audio_and_caption_timing() {
+        let voice = local_voices()
+            .into_iter()
+            .find(|voice| voice.language == "zh_CN")
+            .expect("install a Chinese macOS voice");
         let root = PendingAudio::new(&std::env::temp_dir()).unwrap();
-        let path = root.0.join("empty.mp3");
-        std::fs::write(&path, b"").unwrap();
-        assert!(validate_audio(&path)
-            .unwrap_err()
-            .to_string()
-            .contains("为空"));
+        let path = cached_or_synthesize(
+            "一个人先站了出来。第二个人跟上，队伍慢慢变大。",
+            &voice.name,
+            &root.0.join("local-smoke"),
+        )
+        .unwrap();
+        assert!(validate_audio(&path).unwrap() > 0.0);
+        assert!(!read_word_boundaries(&path).unwrap().is_empty());
     }
 }

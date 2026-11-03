@@ -767,7 +767,7 @@ button.primary:hover:not(:disabled) {
   white-space: nowrap;
 }
 
-.ollama-status {
+.ai-status {
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -779,15 +779,15 @@ button.primary:hover:not(:disabled) {
   background: var(--surface-2);
 }
 
-.ollama-status.online {
+.ai-status.online {
   border-color: rgba(116, 230, 167, 0.3);
 }
 
-.ollama-status.offline {
+.ai-status.offline {
   border-color: rgba(255, 201, 107, 0.25);
 }
 
-.ollama-status p {
+.ai-status p {
   margin: 0.15rem 0 0;
   color: var(--text-muted);
   font-size: 0.75rem;
@@ -895,6 +895,42 @@ button.primary:hover:not(:disabled) {
 .video-preview-foot {
   color: var(--text-muted);
   font-size: 0.72rem;
+}
+
+.shorts-panel .video-preview-tabs button.primary {
+  background: var(--accent);
+  color: #0a0c0f;
+}
+
+.short-card summary {
+  cursor: pointer;
+}
+
+.short-meta,
+.short-premise {
+  color: var(--text-muted);
+  font-size: 0.75rem;
+}
+
+.short-paragraph {
+  margin: 0.6rem 0;
+}
+
+.short-shot {
+  display: block;
+  margin: 6px 0;
+  font-size: 0.72rem;
+}
+
+.short-video video {
+  display: block;
+  height: 28rem;
+  max-width: 100%;
+  aspect-ratio: 9 / 16;
+  object-fit: contain;
+  border-radius: var(--radius-sm);
+  background: #000;
+  margin: 0.75rem 0 0.4rem;
 }
 
 .settings-panel {
