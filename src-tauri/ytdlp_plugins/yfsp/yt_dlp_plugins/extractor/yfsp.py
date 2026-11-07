@@ -474,6 +474,7 @@ class YfspIE(InfoExtractor):
         reject = reject or set()
         preferred = {
             'videoname', 'vodname', 'moviename', 'filmname', 'showname',
+            'mediatitle',
             'albumname', 'seriesname', 'title', 'name',
         }
         for source in sources:
@@ -512,7 +513,13 @@ class YfspIE(InfoExtractor):
             return clarity_sources
 
         flv_paths = info.get('flvPathList') if isinstance(info.get('flvPathList'), list) else []
-        return [item for item in flv_paths if isinstance(item, dict) and item.get('result')]
+        return [
+            item for item in flv_paths
+            if isinstance(item, dict)
+            and item.get('result')
+            and (not isinstance(item.get('duration'), (int, float))
+                 or item['duration'] <= 0 or item['duration'] >= 120)
+        ]
 
     @staticmethod
     def _subtitle_ext(url):
@@ -733,6 +740,12 @@ class YfspIE(InfoExtractor):
             raise ExtractorError(f'YFSP play API returned invalid JSON: {error}', expected=True)
 
         info = self._first_dict((response.get('data') or {}).get('info'))
+        if str(info.get('isPreView', '')).lower() in ('true', '1') or str(
+            info.get('isLimitedStream', '')).lower() in ('true', '1'):
+            raise ExtractorError(
+                '一帆播放接口只返回预览或受限片源，未找到正片；请检查播放页与播放线路',
+                expected=True,
+            )
         sources = self._select_sources(info)
 
         stream_headers = {

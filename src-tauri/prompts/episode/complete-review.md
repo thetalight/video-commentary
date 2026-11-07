@@ -1,0 +1,3 @@
+本次是同一revision的覆盖补评。上面的事实核对、证据、人物、因果、传闻强度与全文连贯规则继续适用；下面的输出协议替代普通评审的findings数组协议。
+required_paragraph_indices列出必须补评的0起段号。对每个指定段，回查完整原字幕并给出真实结论，不能因为这是补评就默认pass。其他段的事实评审已经保存，本次不要重复返回它们。plan仍是当前版本完整稿：coherence必须重新通读全文，覆盖称呼、主线、因果、揭示与前后接续，不能只评漏段或局部摘要。发现其他段的实际矛盾可在coherence定位，不为措辞偏好制造阻塞项。
+只返回revision、findings_by_paragraph、coherence。revision必须原样复制。findings_by_paragraph是对象：键为required_paragraph_indices对应的字符串段号，每个必填，不增其他段号；值仅verdict、reason、evidence_ids，不重复paragraph_index。pass/suggestion也必须有合法非空证据。coherence仍是全稿问题数组，确无问题才为空。不得修改正文、片源、字幕、方案或制造通过标记。

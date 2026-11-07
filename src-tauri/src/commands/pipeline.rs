@@ -3,13 +3,103 @@ use tauri_plugin_opener::OpenerExt;
 
 use crate::models::config::{AppConfig, ExistingJob, PrepareResult};
 use crate::services::{
-    asr, brief, ffmpeg, jobs, jobs::JobPaths, subtitle, task_events, task_store, ytdlp,
+    asr, brief, ffmpeg, jobs, jobs::JobPaths, subtitle, task_events, task_store,
+    transcript_binding, video_url, ytdlp,
 };
 use crate::state::AppState;
 
-const NO_SUBTITLE: &str =
-    "没有字幕可用：平台没有独立字幕，视频也没有可提取的内封文字字幕。已放弃这个视频，不会从画面或音轨识别字幕。";
+const NO_SUBTITLE: &str = "平台没有独立字幕，视频也没有可提取的内封文字字幕。";
 const INGEST_STAGES: [&str; 4] = ["download", "transcribe", "download_subtitle", "prepare"];
+fn valid_source_duration(url: &str, duration: f64, min_yfsp_secs: u32) -> bool {
+    duration.is_finite()
+        && duration > 0.0
+        && (video_url::detect_platform(url) != Some(video_url::VideoPlatform::Yfsp)
+            || duration >= f64::from(min_yfsp_secs))
+}
+
+fn check_source_duration(url: &str, duration: f64, min_yfsp_secs: u32) -> Result<(), String> {
+    if !duration.is_finite() || duration <= 0.0 {
+        return Err("下载的视频无法读取有效时长，请重试下载".into());
+    }
+    if !valid_source_duration(url, duration, min_yfsp_secs) {
+        return Err(format!(
+            "一帆视频时长只有 {duration:.1} 秒，短于设置中的 {} 分钟检查线，疑似预览片或错误线路；请核对播放页后重试",
+            min_yfsp_secs / 60
+        ));
+    }
+    Ok(())
+}
+
+fn quarantine_invalid_source(
+    paths: &JobPaths,
+    url: &str,
+    min_yfsp_secs: u32,
+) -> Result<(), String> {
+    if !paths.source.is_file() {
+        return Ok(());
+    }
+    std::fs::File::open(&paths.source)
+        .map_err(|_| "片源文件不可读，未移动文件；请先检查权限".to_string())?;
+    let result = ffmpeg::get_duration(&paths.source);
+    quarantine_with_probe(paths, url, min_yfsp_secs, result)
+}
+
+fn quarantine_with_probe(
+    paths: &JobPaths,
+    url: &str,
+    min_yfsp_secs: u32,
+    result: Result<f64, ffmpeg::FfmpegError>,
+) -> Result<(), String> {
+    let (duration, reason) = match result {
+        Ok(duration) if valid_source_duration(url, duration, min_yfsp_secs) => return Ok(()),
+        Ok(duration) => (Some(duration), "invalid_or_short_duration"),
+        Err(ffmpeg::FfmpegError::NotFound) => {
+            return Err("ffprobe不可用，无法确认片源是否损坏；未移动文件，请先修复依赖".into())
+        }
+        Err(ffmpeg::FfmpegError::Io(_)) => {
+            return Err("无法启动/读取ffprobe检查，未移动片源；请检查依赖和文件权限".into())
+        }
+        Err(ffmpeg::FfmpegError::Failed(_)) => (None, "unreadable_or_corrupt_container"),
+    };
+    let original_revision = source_revision(&paths.source)?;
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let rejected = paths.root.join("rejected-sources");
+    std::fs::create_dir_all(&rejected).map_err(|error| format!("无法隔离错误片源：{error}"))?;
+    let target = rejected.join(format!("source-{nonce}.mp4"));
+    let report = serde_json::json!({"version":1,"reason":reason,"original_revision":original_revision,"original_bytes":std::fs::metadata(&paths.source).map_err(|e|e.to_string())?.len(),"detected_duration":duration.filter(|d|d.is_finite()),"min_yfsp_duration_secs":min_yfsp_secs,"quarantined_path":target});
+    // Mark the replacement before moving source so old unbound subtitles cannot
+    // be resurrected during a retry or after a crash between these operations.
+    jobs::atomic_write(
+        paths.root.join("source-replacement.json"),
+        serde_json::to_vec_pretty(&report).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    jobs::atomic_write(
+        rejected.join(format!("source-{nonce}.json")),
+        serde_json::to_vec_pretty(&report).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    std::fs::rename(&paths.source, &target)
+        .map_err(|error| format!("无法隔离错误片源：{error}"))?;
+    // Do not resume partial fragments from a previously rejected download.
+    for entry in std::fs::read_dir(&paths.root)
+        .map_err(|e| e.to_string())?
+        .flatten()
+    {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if entry.path().is_file()
+            && name.starts_with("source.")
+            && (name.ends_with(".part") || name.ends_with(".ytdl") || name.contains(".part-Frag"))
+        {
+            std::fs::rename(entry.path(), rejected.join(format!("{nonce}-{name}")))
+                .map_err(|e| format!("隔离旧下载片段失败：{e}"))?;
+        }
+    }
+    Ok(())
+}
 
 /// Explain *why* there is no subtitle instead of the same sentence for every case:
 /// a platform that offers nothing, a platform offering languages we do not accept,
@@ -17,14 +107,12 @@ const INGEST_STAGES: [&str; 4] = ["download", "transcribe", "download_subtitle",
 fn no_subtitle_message(platform_languages: &[String], platform_error: Option<&str>) -> String {
     if !platform_languages.is_empty() {
         return format!(
-            "没有可用的字幕：平台只提供 {} 字幕，不在接受的语种范围内（中文/英文/日文/韩文），视频也没有内封文字字幕。已放弃这个视频，不会从画面或音轨识别字幕。",
+            "平台只提供 {} 字幕，不在接受的语种范围内（中文/英文/日文/韩文），视频也没有内封文字字幕。",
             platform_languages.join("、")
         );
     }
     match platform_error {
-        Some(error) => format!(
-            "没有字幕可用：拉取平台字幕失败（{error}），视频也没有可提取的内封文字字幕。已放弃这个视频，不会从画面或音轨识别字幕。"
-        ),
+        Some(error) => format!("拉取平台字幕失败（{error}），视频也没有可提取的内封文字字幕。"),
         None => NO_SUBTITLE.to_string(),
     }
 }
@@ -55,18 +143,7 @@ async fn config(app: &AppHandle) -> Result<AppConfig, String> {
 
 /// Identity of the downloaded source; shorts drafted against another file are stale.
 pub(crate) fn source_revision(path: &std::path::Path) -> Result<String, String> {
-    let meta = std::fs::metadata(path).map_err(|e| e.to_string())?;
-    let modified = meta
-        .modified()
-        .map_err(|e| e.to_string())?
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|e| e.to_string())?
-        .as_nanos();
-    Ok(jobs::stable_hash(&[
-        path.to_string_lossy().as_bytes(),
-        meta.len().to_string().as_bytes(),
-        modified.to_string().as_bytes(),
-    ]))
+    transcript_binding::source_revision(path)
 }
 
 fn read_meta(paths: &JobPaths) -> serde_json::Value {
@@ -115,23 +192,6 @@ fn transcript_source_file(paths: &JobPaths) -> std::path::PathBuf {
     paths.root.join("TRANSCRIPT.source.json")
 }
 
-fn record_transcript_source(
-    paths: &JobPaths,
-    source: &str,
-    source_path: &std::path::Path,
-) -> Result<(), String> {
-    jobs::atomic_write(
-        transcript_source_file(paths),
-        serde_json::to_vec_pretty(&serde_json::json!({
-            "source": source,
-            "source_path": source_path.to_string_lossy(),
-            "canonical_path": paths.transcript.to_string_lossy()
-        }))
-        .map_err(|error| error.to_string())?,
-    )
-    .map_err(|error| error.to_string())
-}
-
 fn current_transcript_source(paths: &JobPaths) -> String {
     std::fs::read(transcript_source_file(paths))
         .ok()
@@ -147,7 +207,7 @@ pub(crate) fn ensure_supported_transcript_source(paths: &JobPaths) -> Result<(),
     {
         Err(format!("当前任务的字幕来自{source}，该来源已停用。可点击“重新获取字幕”再试平台字幕和视频内封字幕；都没有就放弃这个视频。"))
     } else {
-        Ok(())
+        transcript_binding::verify(&paths.root, &paths.source, &paths.transcript)
     }
 }
 
@@ -160,6 +220,7 @@ async fn acquire_best_available_subtitle(
     platform_subtitle: Option<std::path::PathBuf>,
     platform_languages: &[String],
     platform_error: Option<&str>,
+    progress_stage: &'static str,
 ) -> Result<(std::path::PathBuf, &'static str), String> {
     if let Some(path) = platform_subtitle {
         return Ok((path, "平台独立字幕"));
@@ -168,7 +229,7 @@ async fn acquire_best_available_subtitle(
     task_events::emit_progress(
         app,
         Some(task_id),
-        "transcribe",
+        progress_stage,
         8.0,
         if platform_languages.is_empty() {
             "平台没有独立字幕，正在检查视频内封字幕...".to_string()
@@ -195,8 +256,10 @@ async fn acquire_best_available_subtitle(
     let missing = no_subtitle_message(platform_languages, platform_error);
     if !config.asr_fallback {
         return Err(match embedded_error {
-            Some(error) => format!("{missing}（内封字幕检查失败：{error}）"),
-            None => missing,
+            Some(error) => format!(
+                "{missing}（内封字幕检查失败：{error}）本机语音转写已关闭，已放弃这个视频。"
+            ),
+            None => format!("{missing}本机语音转写已关闭，已放弃这个视频。"),
         });
     }
     if !asr::available(&config.asr_model_path) {
@@ -208,7 +271,7 @@ async fn acquire_best_available_subtitle(
     task_events::emit_progress(
         app,
         Some(task_id),
-        "transcribe",
+        progress_stage,
         10.0,
         "平台字幕与内封字幕都没有，正在用本机语音转写生成逐字稿...",
     );
@@ -232,7 +295,7 @@ async fn acquire_best_available_subtitle(
                 task_events::emit_progress(
                     &progress_handle,
                     Some(&progress_task),
-                    "transcribe",
+                    progress_stage,
                     percent,
                     message,
                 )
@@ -247,7 +310,7 @@ async fn acquire_best_available_subtitle(
             task_events::emit_progress(
                 app,
                 Some(task_id),
-                "transcribe",
+                progress_stage,
                 95.0,
                 format!("本机语音转写完成：{} 条对白", output.segments),
             );
@@ -264,17 +327,8 @@ fn install_transcript(
     subtitle_path: &std::path::Path,
     subtitle_source: &str,
 ) -> Result<Vec<subtitle::SubtitleEntry>, String> {
-    let entries = brief::install_transcript(subtitle_path, &paths.transcript)
-        .map_err(|error| format!("保存字幕失败：{error}"))?;
-    record_transcript_source(paths, subtitle_source, subtitle_path)?;
-    let transcript_raw = std::fs::read(&paths.transcript).map_err(|error| error.to_string())?;
-    task_store::artifact(
-        task_id,
-        "transcript",
-        &paths.transcript.to_string_lossy(),
-        &jobs::stable_hash(&[&transcript_raw]),
-        "",
-    )?;
+    let entries = subtitle::parse_file(subtitle_path)
+        .map_err(|error| format!("读取候选字幕失败：{error}"))?;
     let quality = subtitle::assess_quality(&entries);
     if quality.needs_retranscription {
         return Err(format!(
@@ -283,6 +337,33 @@ fn install_transcript(
             quality.reasons.join("、")
         ));
     }
+    let binding = transcript_binding::create(
+        &paths.source,
+        &paths.transcript,
+        subtitle_path,
+        subtitle_source,
+        &entries,
+    )?;
+    // Fail closed after any interrupted install; canonical bytes + provenance +
+    // artifact are committed before clearing this small installation marker.
+    jobs::atomic_write(transcript_binding::pending(&paths.root),serde_json::to_vec(&serde_json::json!({"version":1,"source_revision":binding.source_revision,"transcript_revision":binding.transcript_revision})).map_err(|e|e.to_string())?).map_err(|e|e.to_string())?;
+    // Install exactly the entries we quality-checked, not a second read of a
+    // candidate that could have changed between validation and promotion.
+    jobs::atomic_write(&paths.transcript, subtitle::to_srt(&entries).as_bytes())
+        .map_err(|error| format!("保存字幕失败：{error}"))?;
+    if source_revision(&paths.source)? != binding.source_revision {
+        return Err("字幕安装期间原片已变化，已阻止使用此字幕；请重新获取".into());
+    }
+    transcript_binding::write(&paths.root, &binding)?;
+    let transcript_raw = std::fs::read(&paths.transcript).map_err(|error| error.to_string())?;
+    task_store::artifact(
+        task_id,
+        "transcript",
+        &paths.transcript.to_string_lossy(),
+        &jobs::stable_hash(&[&transcript_raw]),
+        &binding.source_revision,
+    )?;
+    std::fs::remove_file(transcript_binding::pending(&paths.root)).map_err(|e| e.to_string())?;
     Ok(entries)
 }
 
@@ -296,7 +377,13 @@ fn translation_failure_transcript(
     if !previous_error.is_some_and(|error| error.starts_with("翻译失败：")) {
         return None;
     }
-    if !paths.source.is_file() || ensure_supported_transcript_source(paths).is_err() {
+    if !paths.source.is_file()
+        || !transcript_binding::recover_legacy_translation(
+            &paths.root,
+            &paths.source,
+            &paths.transcript,
+        )
+    {
         return None;
     }
     let source = current_transcript_source(paths);
@@ -318,6 +405,7 @@ fn prepared(
     config: &AppConfig,
     task_id: &str,
     title: &str,
+    url: &str,
     duration: f64,
     entries: &[subtitle::SubtitleEntry],
 ) -> PrepareResult {
@@ -326,7 +414,8 @@ fn prepared(
         job_dir: paths.root.to_string_lossy().into_owned(),
         source_path: paths.source.to_string_lossy().into_owned(),
         transcript_path: paths.transcript.to_string_lossy().into_owned(),
-        source_available: paths.source.exists(),
+        source_available: paths.source.is_file()
+            && valid_source_duration(url, duration, config.yfsp_min_duration_secs),
         transcript_available: paths.transcript.exists(),
         subtitle_source: current_transcript_source(paths),
         title: title.to_string(),
@@ -338,6 +427,32 @@ fn prepared(
             config.skip_ads,
         ),
     }
+}
+
+async fn fetch_platform_subtitle(
+    app: &AppHandle,
+    config: &AppConfig,
+    task_id: &str,
+    url: &str,
+    job_root: &std::path::Path,
+) -> Result<ytdlp::SubtitleFetch, String> {
+    let app_download = app.clone();
+    let job_root = job_root.to_path_buf();
+    let url = url.to_string();
+    let options = ytdlp::DownloadOptions {
+        cookies_browser: (!config.cookies_browser.is_empty())
+            .then(|| config.cookies_browser.clone()),
+        video_quality: config.video_quality.clone(),
+        task_id: Some(task_id.to_string()),
+    };
+    let download_permit = app.state::<AppState>().acquire_download().await?;
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        ytdlp::download_subtitles_into_job(&app_download, &url, &job_root, options)
+    })
+    .await
+    .map_err(|error| error.to_string())?;
+    drop(download_permit);
+    result.map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -370,6 +485,7 @@ async fn prepare_job_inner(
         .unwrap_or_else(|| config.default_style.clone());
     let paths = job_paths(&config, task_id)?;
     paths.ensure().map_err(|e| e.to_string())?;
+    quarantine_invalid_source(&paths, &url, config.yfsp_min_duration_secs)?;
 
     let app_dl = app.clone();
     let task_id_dl = task_id.to_string();
@@ -389,24 +505,36 @@ async fn prepare_job_inner(
     .map_err(|e| e.to_string())?
     .map_err(|e| e.to_string())?;
     drop(download_permit);
-    task_store::ensure_task(task_id, &download.title, &url)?;
-    task_store::finish_stage(task_id, "download", "running", "原片下载完成")?;
-    task_store::start_stage(task_id, "transcribe", "正在获取字幕")?;
-
-    let duration = ffmpeg::get_duration(&download.video_path).unwrap_or(0.0);
+    let duration = ffmpeg::get_duration(&download.video_path).map_err(|error| error.to_string())?;
+    check_source_duration(&url, duration, config.yfsp_min_duration_secs)?;
+    let subtitle_input_revision = source_revision(&paths.source)?;
     brief::write_meta(&paths, task_id, &download.title, &url, duration, &style)
         .map_err(|e| e.to_string())?;
+    task_store::ensure_task(task_id, &download.title, &url)?;
+    task_store::finish_stage(task_id, "download", "running", "原片下载完成")?;
+    task_store::start_stage(task_id, "download_subtitle", "正在获取平台字幕")?;
+    let subtitle_result = fetch_platform_subtitle(app, &config, task_id, &url, &paths.root).await;
+    let (platform_subtitle, platform_languages, platform_error) = match subtitle_result {
+        Ok(fetch) => (fetch.path, fetch.platform_languages, fetch.error),
+        Err(error) => (None, Vec::new(), Some(error)),
+    };
+    task_store::finish_stage(task_id, "download_subtitle", "running", "平台字幕检查完成")?;
+    task_store::start_stage(task_id, "transcribe", "正在整理字幕")?;
     let (subtitle_path, subtitle_source) = acquire_best_available_subtitle(
         app,
         &config,
         &paths,
         task_id,
         &download.video_path,
-        download.subtitle_path,
-        &download.subtitle_languages,
-        download.subtitle_error.as_deref(),
+        platform_subtitle,
+        &platform_languages,
+        platform_error.as_deref(),
+        "transcribe",
     )
     .await?;
+    if source_revision(&paths.source)? != subtitle_input_revision {
+        return Err("字幕获取期间原片已更换，未安装候选字幕；请重试获取当前原片字幕".into());
+    }
     let entries = install_transcript(&paths, task_id, &subtitle_path, subtitle_source)?;
 
     let message = "原片与原语言字幕已就绪，可直接生成中文整集解说（不逐条翻译字幕）";
@@ -417,21 +545,35 @@ async fn prepare_job_inner(
         &config,
         task_id,
         &download.title,
+        &url,
         duration,
         &entries,
     ))
 }
 
-fn shorts_counts(paths: &JobPaths) -> (usize, usize) {
+fn shorts_counts(paths: &JobPaths, config: &AppConfig, task_id: &str) -> (usize, usize) {
     // Existing IPC counters are retained for queue compatibility, but now count
     // the single episode output. Legacy shorts remain on disk, not in this UI.
     let Some(value) = crate::commands::episode::read_episode(paths).ok().flatten() else {
         return (0, 0);
     };
-    let rendered = value
-        .output_path
-        .as_deref()
-        .is_some_and(|path| std::path::Path::new(path).is_file());
+    let material_current = crate::commands::shorts::material_from_config(config.clone(), task_id)
+        .ok()
+        .is_some_and(|material| {
+            value.transcript_revision
+                == crate::services::script::transcript_revision(&material.entries)
+                && source_revision(&paths.source)
+                    .is_ok_and(|revision| revision == value.source_revision)
+                && material.episode_film().is_ok_and(|shots| {
+                    crate::services::script::same_source_windows(&value.shots, &shots)
+                })
+        });
+    let rendered = material_current
+        && value.reviewed_revision.as_deref() == Some(value.revision.as_str())
+        && value
+            .output_path
+            .as_deref()
+            .is_some_and(|path| std::path::Path::new(path).is_file());
     (1, usize::from(rendered))
 }
 
@@ -458,7 +600,8 @@ pub async fn list_existing_jobs(app: AppHandle) -> Result<Vec<ExistingJob>, Stri
         };
         let paths = job_paths(&config, &task_id)?;
         let meta = read_meta(&paths);
-        let stored = task_store::get(&task_id)?;
+        let snapshot = task_store::read_snapshot(&task_id);
+        let stored = task_store::get(&task_id)?.or(snapshot.clone());
         let title = meta_str(&meta, "title")
             .or_else(|| {
                 stored
@@ -467,7 +610,20 @@ pub async fn list_existing_jobs(app: AppHandle) -> Result<Vec<ExistingJob>, Stri
                     .filter(|title| !title.is_empty())
             })
             .unwrap_or_else(|| task_id.clone());
-        let meta_url = meta_str(&meta, "url").unwrap_or_default();
+        let meta_url = stored
+            .as_ref()
+            .and_then(|task| {
+                let url = task.source_url.trim();
+                (!url.is_empty()).then(|| url.to_string())
+            })
+            .or_else(|| meta_str(&meta, "url"))
+            .or_else(|| {
+                snapshot
+                    .as_ref()
+                    .map(|task| task.source_url.trim().to_string())
+                    .filter(|url| !url.is_empty())
+            })
+            .unwrap_or_default();
         task_store::ensure_task(&task_id, &title, &meta_url)?;
         let duration = if paths.source.exists() {
             ffmpeg::get_duration(&paths.source).unwrap_or(0.0)
@@ -476,11 +632,15 @@ pub async fn list_existing_jobs(app: AppHandle) -> Result<Vec<ExistingJob>, Stri
         };
         let entries = subtitle::parse_file(&paths.transcript).unwrap_or_default();
         let unsupported = ensure_supported_transcript_source(&paths).err();
-        let materials = paths.source.exists() && !entries.is_empty() && unsupported.is_none();
+        let materials = paths.source.is_file()
+            && valid_source_duration(&meta_url, duration, config.yfsp_min_duration_secs)
+            && !entries.is_empty()
+            && !subtitle::assess_quality(&entries).needs_retranscription
+            && unsupported.is_none();
         let ingest_failed = stored.as_ref().is_some_and(|task| {
             task.status == "failed" && INGEST_STAGES.contains(&task.stage.as_str())
         });
-        let (shorts_total, shorts_rendered) = shorts_counts(&paths);
+        let (shorts_total, shorts_rendered) = shorts_counts(&paths, &config, &task_id);
         let (status, error) = if stored.as_ref().is_some_and(|task| task.status == "running") {
             ("running", None)
         } else if materials && !ingest_failed {
@@ -500,7 +660,12 @@ pub async fn list_existing_jobs(app: AppHandle) -> Result<Vec<ExistingJob>, Stri
                 .or(unsupported)
                 .unwrap_or_else(|| {
                     if paths.source.exists() {
-                        "这个任务没有可用字幕，可重新获取字幕；仍没有就放弃这个视频".to_string()
+                        check_source_duration(&meta_url, duration, config.yfsp_min_duration_secs)
+                            .err()
+                            .unwrap_or_else(|| {
+                                "这个任务没有可用字幕，可重新获取字幕；仍没有就放弃这个视频"
+                                    .to_string()
+                            })
                     } else {
                         "视频下载尚未完成，可使用原链接重试".to_string()
                     }
@@ -520,7 +685,9 @@ pub async fn list_existing_jobs(app: AppHandle) -> Result<Vec<ExistingJob>, Stri
         .max(stored.as_ref().map(|task| task.updated_at_ms).unwrap_or(0));
 
         restored.push(ExistingJob {
-            prepare: prepared(&paths, &config, &task_id, &title, duration, &entries),
+            prepare: prepared(
+                &paths, &config, &task_id, &title, &meta_url, duration, &entries,
+            ),
             task_id,
             title,
             status: status.to_string(),
@@ -579,7 +746,8 @@ async fn refetch_subtitles_inner(app: &AppHandle, task_id: &str) -> Result<Prepa
         return Err("任务原片不存在，无法获取字幕".into());
     }
     // Capture the failure before start_stage clears its error fields.
-    let stored = task_store::get(task_id)?;
+    let snapshot = task_store::read_snapshot(task_id);
+    let stored = task_store::get(task_id)?.or_else(|| snapshot.clone());
     let recovered = translation_failure_transcript(
         &paths,
         stored
@@ -595,6 +763,12 @@ async fn refetch_subtitles_inner(app: &AppHandle, task_id: &str) -> Result<Prepa
                 .map(|task| task.source_url.trim().to_string())
                 .filter(|value| !value.is_empty())
         })
+        .or_else(|| {
+            snapshot
+                .as_ref()
+                .map(|task| task.source_url.trim().to_string())
+                .filter(|value| !value.is_empty())
+        })
         .ok_or("任务缺少原始播放地址，无法拉取平台字幕")?;
     let title = meta_str(&meta, "title")
         .or_else(|| {
@@ -605,6 +779,8 @@ async fn refetch_subtitles_inner(app: &AppHandle, task_id: &str) -> Result<Prepa
         })
         .unwrap_or_else(|| task_id.to_string());
     let duration = ffmpeg::get_duration(&paths.source).map_err(|error| error.to_string())?;
+    check_source_duration(&url, duration, config.yfsp_min_duration_secs)?;
+    let subtitle_input_revision = source_revision(&paths.source)?;
     if meta_str(&meta, "url").is_none() || meta_str(&meta, "title").is_none() {
         brief::write_meta(
             &paths,
@@ -619,29 +795,35 @@ async fn refetch_subtitles_inner(app: &AppHandle, task_id: &str) -> Result<Prepa
     task_store::ensure_task(task_id, &title, &url)?;
 
     if let Some(entries) = recovered {
+        // Explicit retry completes provenance for the legacy translation-failure
+        // path; no original transcript bytes or timestamps are rewritten.
+        let mut binding = transcript_binding::create(
+            &paths.source,
+            &paths.transcript,
+            &paths.transcript,
+            &current_transcript_source(&paths),
+            &entries,
+        )?;
+        // Retried historical originals need not have identical SRT whitespace;
+        // bind existing bytes without silently normalizing/replacing their text.
+        binding.canonical_bytes_revision =
+            jobs::stable_hash(&[&std::fs::read(&paths.transcript).map_err(|e| e.to_string())?]);
+        transcript_binding::write(&paths.root, &binding)?;
+        task_store::artifact(
+            task_id,
+            "transcript",
+            &paths.transcript.to_string_lossy(),
+            &jobs::stable_hash(&[&std::fs::read(&paths.transcript).map_err(|e| e.to_string())?]),
+            &binding.source_revision,
+        )?;
         let message = "已复用翻译失败前保存的原语言字幕，可直接生成中文整集解说；不重下、不重转写、不全文翻译";
         task_events::emit_progress(app, Some(task_id), "download_subtitle", 100.0, message);
         task_store::finish_stage(task_id, "download_subtitle", "ready", message)?;
         return Ok(prepared(
-            &paths, &config, task_id, &title, duration, &entries,
+            &paths, &config, task_id, &title, &url, duration, &entries,
         ));
     }
-
-    let app_download = app.clone();
-    let job_root = paths.root.clone();
-    let options = ytdlp::DownloadOptions {
-        cookies_browser: (!config.cookies_browser.is_empty())
-            .then(|| config.cookies_browser.clone()),
-        video_quality: config.video_quality.clone(),
-        task_id: Some(task_id.to_string()),
-    };
-    let download_permit = app.state::<AppState>().acquire_download().await?;
-    let subtitle_result = tauri::async_runtime::spawn_blocking(move || {
-        ytdlp::download_subtitles_into_job(&app_download, &url, &job_root, options)
-    })
-    .await
-    .map_err(|error| error.to_string())?;
-    drop(download_permit);
+    let subtitle_result = fetch_platform_subtitle(app, &config, task_id, &url, &paths.root).await;
     let (platform_subtitle, platform_languages, platform_error) = match subtitle_result {
         Ok(fetch) => (fetch.path, fetch.platform_languages, fetch.error),
         Err(error) => {
@@ -660,15 +842,19 @@ async fn refetch_subtitles_inner(app: &AppHandle, task_id: &str) -> Result<Prepa
         platform_subtitle,
         &platform_languages,
         platform_error.as_deref(),
+        "download_subtitle",
     )
     .await?;
+    if source_revision(&paths.source)? != subtitle_input_revision {
+        return Err("字幕重试期间原片已更换，未安装候选字幕；请重新获取当前原片字幕".into());
+    }
     let entries = install_transcript(&paths, task_id, &subtitle_path, subtitle_source)?;
     let message =
         format!("{subtitle_source}已保存为原语言，可直接生成中文整集解说（不逐条翻译字幕）");
     task_events::emit_progress(app, Some(task_id), "download_subtitle", 100.0, &message);
     task_store::finish_stage(task_id, "download_subtitle", "ready", &message)?;
     Ok(prepared(
-        &paths, &config, task_id, &title, duration, &entries,
+        &paths, &config, task_id, &title, &url, duration, &entries,
     ))
 }
 
@@ -694,6 +880,22 @@ pub async fn delete_job(app: AppHandle, task_id: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+pub async fn reveal_in_finder(app: AppHandle, path: String) -> Result<(), String> {
+    let requested = std::path::Path::new(&path)
+        .canonicalize()
+        .map_err(|_| "成片文件不存在或已被移动，请检查任务目录".to_string())?;
+    let inbox = jobs::inbox_root()
+        .canonicalize()
+        .map_err(|_| "任务目录不存在".to_string())?;
+    if !requested.starts_with(&inbox) {
+        return Err("只能定位inbox中的任务资源".into());
+    }
+    app.opener()
+        .reveal_item_in_dir(&requested)
+        .map_err(|_| "无法在Finder中定位文件，请检查系统文件管理器".to_string())
+}
+
+#[tauri::command]
 pub async fn reveal_path(app: AppHandle, path: String) -> Result<(), String> {
     let requested = std::path::Path::new(&path)
         .canonicalize()
@@ -712,8 +914,8 @@ pub async fn reveal_path(app: AppHandle, path: String) -> Result<(), String> {
 #[cfg(test)]
 mod pipeline_tests {
     use super::{
-        delete_all_task_directories, no_subtitle_message, translation_failure_transcript,
-        validate_task_id,
+        check_source_duration, delete_all_task_directories, install_transcript,
+        no_subtitle_message, translation_failure_transcript, validate_task_id,
     };
 
     #[test]
@@ -797,6 +999,145 @@ mod pipeline_tests {
 
         let nothing = no_subtitle_message(&[], None);
         assert!(nothing.contains("平台没有独立字幕"));
+    }
+
+    #[test]
+    fn corrupt_sources_are_quarantined_but_probe_dependency_failures_never_move_them() {
+        use crate::services::{ffmpeg::FfmpegError, jobs::JobPaths};
+        let root = std::env::temp_dir().join(format!(
+            "quarantine-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let paths = JobPaths {
+            source: root.join("source.mp4"),
+            transcript: root.join("TRANSCRIPT.srt"),
+            meta: root.join("META.json"),
+            shorts: root.join("shorts"),
+            root: root.clone(),
+        };
+        std::fs::write(&paths.source, b"synthetic corrupt container").unwrap();
+        std::fs::write(&paths.transcript, b"old transcript must remain").unwrap();
+        assert!(super::quarantine_with_probe(
+            &paths,
+            "https://example.com/video",
+            0,
+            Err(FfmpegError::NotFound)
+        )
+        .is_err());
+        assert!(paths.source.exists());
+        assert!(!root.join("source-replacement.json").exists());
+        assert!(super::quarantine_with_probe(
+            &paths,
+            "https://example.com/video",
+            0,
+            Err(FfmpegError::Io(std::io::Error::from(
+                std::io::ErrorKind::PermissionDenied
+            )))
+        )
+        .is_err());
+        assert!(paths.source.exists());
+        std::fs::write(root.join("source.mp4.part"), b"old partial").unwrap();
+        std::fs::write(root.join("source.mp4.ytdl"), b"old resume state").unwrap();
+        super::quarantine_with_probe(
+            &paths,
+            "https://example.com/video",
+            0,
+            Err(FfmpegError::Failed("synthetic corrupt data".into())),
+        )
+        .unwrap();
+        assert!(!paths.source.exists());
+        assert!(!root.join("source.mp4.part").exists());
+        assert!(!root.join("source.mp4.ytdl").exists());
+        assert_eq!(
+            std::fs::read(&paths.transcript).unwrap(),
+            b"old transcript must remain"
+        );
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join("source-replacement.json")).unwrap())
+                .unwrap();
+        assert_eq!(manifest["reason"], "unreadable_or_corrupt_container");
+        assert!(manifest["original_revision"].is_string());
+        assert!(root
+            .join("rejected-sources")
+            .join(manifest["quarantined_path"].as_str().unwrap())
+            .exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn valid_sources_are_preserved_and_only_yfsp_uses_configured_minimum() {
+        use crate::services::jobs::JobPaths;
+        let root = std::env::temp_dir().join(format!("valid-source-test-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let paths = JobPaths {
+            source: root.join("source.mp4"),
+            transcript: root.join("TRANSCRIPT.srt"),
+            meta: root.join("META.json"),
+            shorts: root.join("shorts"),
+            root: root.clone(),
+        };
+        std::fs::write(&paths.source, b"synthetic video").unwrap();
+        super::quarantine_with_probe(&paths, "https://example.com/video", 600, Ok(12.0)).unwrap();
+        assert!(paths.source.exists());
+        super::quarantine_with_probe(
+            &paths,
+            "https://www.yfsp.tv/play/example?id=episode",
+            600,
+            Ok(429.0),
+        )
+        .unwrap();
+        assert!(!paths.source.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn short_yfsp_preview_is_rejected_but_short_generic_video_is_allowed() {
+        let url = "https://www.yfsp.tv/play/example?id=episode";
+        assert!(check_source_duration(url, 429.67, 600)
+            .unwrap_err()
+            .contains("疑似预览片"));
+        assert!(check_source_duration(url, 429.67, 0).is_ok());
+        assert!(check_source_duration(url, 2725.48, 600).is_ok());
+        assert!(check_source_duration("https://example.com/video", 429.67, 600).is_ok());
+        assert!(check_source_duration(url, 0.0, 600).is_err());
+    }
+
+    #[test]
+    fn rejected_candidate_does_not_replace_existing_transcript() {
+        use crate::services::jobs::JobPaths;
+        let root = std::env::temp_dir().join(format!(
+            "vc-rejected-subtitle-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let paths = JobPaths {
+            source: root.join("source.mp4"),
+            transcript: root.join("TRANSCRIPT.srt"),
+            meta: root.join("META.json"),
+            shorts: root.join("shorts"),
+            root: root.clone(),
+        };
+        let original = b"1\n00:00:01,000 --> 00:00:02,000\nOriginal subtitle\n";
+        std::fs::write(&paths.transcript, original).unwrap();
+        let candidate = root.join("candidate.srt");
+        std::fs::write(
+            &candidate,
+            "1\n00:00:01,000 --> 00:00:02,000\n以下是影视剧对白\n",
+        )
+        .unwrap();
+        assert!(install_transcript(&paths, "test", &candidate, "平台独立字幕").is_err());
+        assert_eq!(std::fs::read(&paths.transcript).unwrap(), original);
+        assert!(!root.join("TRANSCRIPT.source.json").exists());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

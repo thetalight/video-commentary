@@ -49,7 +49,7 @@ fn matches_schema(value: &Value, schema: &Value) -> bool {
 
 /// Diagnostics contain schema-owned paths/types only, never model prose, unknown
 /// field names, actual enum values or provider responses that could include secrets.
-fn schema_issues(value: &Value, schema: &Value) -> Vec<String> {
+pub(crate) fn schema_issues(value: &Value, schema: &Value) -> Vec<String> {
     let mut issues = Vec::new();
     inspect_schema(value, schema, "$", &mut issues);
     issues.truncate(4);
@@ -75,6 +75,8 @@ fn inspect_schema(value: &Value, schema: &Value, path: &str, issues: &mut Vec<St
                 | "minimum"
                 | "maximum"
                 | "enum"
+                | "maxLength"
+                | "minLength"
         )
     }) {
         issues.push(format!("{path}: 应用schema含不支持的规则"));
@@ -172,7 +174,15 @@ fn inspect_schema(value: &Value, schema: &Value, path: &str, issues: &mut Vec<St
             }
         }
         Some("string") => {
-            if !value.is_string() {
+            if let Some(text)=value.as_str() {
+                let count=text.chars().count() as u64;
+                if schema.get("maxLength").and_then(Value::as_u64).is_some_and(|max|count>max) {
+                    issues.push(format!("{path}: 字符数{count}超过maxLength={}（含标点，须精简且保留有据事实）",schema["maxLength"]));
+                }
+                if schema.get("minLength").and_then(Value::as_u64).is_some_and(|min|count<min) {
+                    issues.push(format!("{path}: 字符数少于minLength"));
+                }
+            } else {
                 issues.push(format!("{path}: 必须为string，不接受null/对象/数组"));
             }
         }
@@ -267,6 +277,21 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn unicode_length_limit_retries_overlong_text_once() {
+        let schema=json!({"type":"object","properties":{"text":{"type":"string","minLength":1,"maxLength":102}},"required":["text"],"additionalProperties":false});
+        let mut calls=0;
+        let value=schema_response(&schema,|feedback|{
+            calls+=1;
+            if calls==2{assert!(feedback.contains("maxLength=102"));}
+            std::future::ready(Ok(json!({"text":"甲".repeat(if calls==1{113}else{102})})))
+        }).await.unwrap();
+        assert_eq!(calls,2);assert_eq!(value["text"].as_str().unwrap().chars().count(),102);
+        let unicode=json!({"type":"string","maxLength":3,"minLength":1});
+        assert!(schema_issues(&json!("中😀，"),&unicode).is_empty());
+        assert!(!schema_issues(&json!("中😀，。"),&unicode).is_empty());
+        assert!(!schema_issues(&json!(""),&unicode).is_empty());
+    }
     #[tokio::test]
     async fn deepseek_wire_contract_uses_bearer_json_mode_and_no_ollama_parameters() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};

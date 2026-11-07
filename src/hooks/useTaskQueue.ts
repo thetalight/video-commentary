@@ -114,7 +114,8 @@ export function useTaskQueue() {
       try {
         const result = await command();
         patch(taskId, (task) => ({
-          status: task.shortsRendered > 0 ? "completed" : "ready",
+          status: step === "download_subtitle" ? "ready" : task.shortsRendered > 0 ? "completed" : "ready",
+          shortsRendered: step === "download_subtitle" ? 0 : task.shortsRendered,
           prepare: result,
           label: result.title || task.label,
           progress: null,

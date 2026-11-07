@@ -17,6 +17,18 @@
 - 当前单次安全输入100000字符，长阶段输出24000 tokens，目标≤5000字符且输入可容纳时一次全文生成，否则按同一方案携带完整前文连续续写。超安全输入停止；没有自动层级索引或自动续跑，检查点仅供诊断。
 - 新整集在最终混音和烧字幕后检查静音/黑场/静止及±0.5秒时钟差；输出1920×1080等比补边，不是旧竖屏。
 
+## 素材身份与字幕安装
+
+统一transcript_binding检查原片身份、规范字幕内容/字节，pending安装标记阻止半成品进入写稿/审稿/迁移/出片；数据库artifact.input_revision记录原片revision。历史无绑定仅由episode/shorts内同源同字幕revision证明时只读兼容，不静默写绑定；退役翻译失败可按窄条件显式重试恢复，不改原文。损坏/不合格源重试前隔离并留原因和续传碎片，ffprobe/权限问题不擅自移文件。受管理/替换源/pending不恢复旧sidecar或TRANSCRIPT.zh译文。
+
+## 当前schema-v2剪辑契约
+
+Episode.schema_version=2，plan:{title,paragraphs:[{narration,evidence_quote,evidence_refs,visual_selections}]}。证据可短于0.8秒且可重复引用，完整短回答可作为短引文；visual_selections每项{candidate_id,start,end,must_keep_ranges:[{start,end}]}独立选画面，须候选内、≥1秒、段内有序且全稿不重叠，储备≥字数×0.3。候选仍是字幕关联窗，不是真视觉镜头；人工动作保护须看片确认，AI只能新增所引完整字幕窗保护，且自动修复不能删改已有保护。
+
+旧schema-v1读为只读视图，不写回。migrate_episode显式迁移先归档schema-v1-original.json，再分别复制旧shot_ids为证据/全窗画面、清旧评审与当前成片引用，不猜保护，需核对重评。材料/排除规则变化拒绝迁移，旧稿保留；新生成为v2。
+
+全部配音实测、独立音轨检查后compile edit-plan.json，绑定源/字幕/全文revision，确定源秒级截取与输出累计时钟。先分配每镜≥1秒及必保包络，再分配余量，围绕包络裁剪；无保护居中，不再取窗口前部。预算装不下保护/镜头，或画面不足/重叠则输出冲突诊断、不渲染。FFmpeg执行计划。尚无VFR逐帧、视觉切点/句界吸附、原声主导段/留白或多轨timeline；不得宣称自然接点和表演完整均已保证。不引入额外模型。
+
 ## 可选联网与自动修稿
 
 TAVILY_API_KEY由同一.env后端读取，留空只按字幕修稿。生成/单独审稿首次需修复时，AI可规划一次最多3条查询（各≤160字符、合法问题段）；只发关键词，过滤长原文摘录，不传完整字幕/稿件，固定Tavily搜索端点，不自动抓页或执行网页。结果摘要和来源存web-research.json/Episode.research，以untrusted参考传修稿与复审，不替代原文证据。搜索失败不视为通过。

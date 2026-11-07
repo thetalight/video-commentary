@@ -2,7 +2,9 @@ export interface AppConfig {
   output_dir: string;
   cookies_browser: string;
   video_quality: string;
+  yfsp_min_duration_secs: number;
   tts_voice: string;
+  tts_instruction: string;
   original_audio_mode: string;
   duck_db: number;
   source_caption_mask_percent: number;
@@ -31,6 +33,7 @@ export interface ExcludedRange {
 }
 
 export interface ExclusionReport {
+  candidate_fingerprint: string;
   policy_version: string;
   source_duration: number;
   original_cue_count: number;
@@ -148,6 +151,23 @@ export interface ShortItem {
   warnings: string[];
 }
 
+export interface VisualSelection {
+  candidate_id: number;
+  start: number;
+  end: number;
+  must_keep_ranges: { start: number; end: number }[];
+}
+export interface EpisodeParagraph {
+  narration: string;
+  evidence_quote: string;
+  evidence_refs: number[];
+  visual_selections: VisualSelection[];
+  audio_owner?: "narration" | "original_dialogue" | "original_action" | "silence";
+}
+export interface EpisodeScript {
+  title: string;
+  paragraphs: EpisodeParagraph[];
+}
 export interface Episode {
   schema_version: number;
   transcript_revision: string;
@@ -159,11 +179,13 @@ export interface Episode {
     reveal_order: string;
     beats: { task: string; shot_ids: number[] }[];
     covered_events: { event_index: number; decision: string; reason: string }[];
+    narration_brief?: { opening_context: string; timeline: string; throughline: string; scenes: { beat_indices: number[]; context: string; transition: string }[] };
   };
-  plan: ShortScript;
+  plan: EpisodeScript;
   shots: SampleShot[];
   target_secs: number;
   reviewed_revision: string | null;
+  audience_review?: { verdict: string; opening_clear: boolean; timeline_clear: boolean; continuity_clear: boolean; oral_language_natural: boolean; text_revision: string; issues: { paragraph_indices: number[]; category: string; reason: string }[] };
   review_error: string | null;
   research?: {
     query: { query: string; reason: string; paragraph_indices: number[] };

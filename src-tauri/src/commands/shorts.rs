@@ -67,9 +67,32 @@ impl Material {
         script::film_shots(&self.entries, self.duration, &excluded)
     }
 
-    pub(super) fn episode_film(&self) -> Vec<script::Shot> {
-        let excluded = subtitle::detect_excluded_ranges(&self.entries, self.duration, self.config.skip_intro_outro, self.config.skip_ads);
-        script::episode_shots(&self.entries, self.duration, &excluded)
+    pub(super) fn episode_exclusion_report(&self) -> Result<subtitle::ExclusionReport, String> {
+        let mut report = subtitle::exclusion_report(
+            &self.entries,
+            self.duration,
+            self.config.skip_intro_outro,
+            self.config.skip_ads,
+        );
+        let path = self.paths.root.join("episode/exclusion-choices.json");
+        if path.exists() {
+            let choices: subtitle::ExclusionChoices =
+                serde_json::from_slice(&std::fs::read(path).map_err(|e| e.to_string())?)
+                    .map_err(|_| "人工排除配置损坏".to_string())?;
+            subtitle::apply_exclusion_choices(
+                &mut report,
+                &choices,
+                &script::transcript_revision(&self.entries),
+            )?;
+        }
+        Ok(report)
+    }
+    pub(super) fn episode_film(&self) -> Result<Vec<script::Shot>, String> {
+        Ok(script::episode_shots(
+            &self.entries,
+            self.duration,
+            &self.episode_exclusion_report()?.applied_ranges,
+        ))
     }
 
     pub(super) async fn ai(&self) -> Result<AiOptions, String> {
@@ -83,6 +106,33 @@ pub(super) async fn material(app: &AppHandle, task_id: &str) -> Result<Material,
         .get_config()
         .await
         .map_err(|e| e.to_string())?;
+    let task_id = task_id.to_string();
+    tauri::async_runtime::spawn_blocking(move || material_from_config(config, &task_id))
+        .await
+        .map_err(|_| "素材检查线程中止，请重试；未提交AI请求".to_string())?
+}
+#[cfg(test)]
+pub(super) fn material_from_config_for_diagnostics(task_id: &str) -> Result<Material, String> {
+    let path = dirs::data_dir()
+        .unwrap()
+        .join("com.esun.video-commentary/settings.json");
+    let stored: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(path).map_err(|e| e.to_string())?)
+            .map_err(|_| "settings parse".to_string())?;
+    let config: AppConfig =
+        serde_json::from_value(stored["config"].clone()).map_err(|_| "config parse".to_string())?;
+    let paths = JobPaths::new(&config.output_dir, task_id);
+    let entries = subtitle::parse_file(&paths.transcript).map_err(|e| e.to_string())?;
+    let duration = ffmpeg::get_duration(&paths.source).map_err(|e| e.to_string())?;
+    Ok(Material {
+        paths,
+        config,
+        entries,
+        duration,
+        style: String::new(),
+    })
+}
+pub(super) fn material_from_config(config: AppConfig, task_id: &str) -> Result<Material, String> {
     let paths = job_paths(&config, task_id)?;
     ensure_supported_transcript_source(&paths)?;
     let entries = subtitle::parse_file(&paths.transcript).map_err(|e| e.to_string())?;
@@ -227,6 +277,7 @@ pub(super) fn render_settings(config: &AppConfig) -> Result<RenderSettings, Stri
     };
     Ok(RenderSettings {
         voice: config.tts_voice.clone(),
+        instruction: config.tts_instruction.clone(),
         mask_percent: config.source_caption_mask_percent,
         ambience: config.original_volume(),
         music,

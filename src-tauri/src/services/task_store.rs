@@ -264,6 +264,15 @@ pub fn get(task_id: &str) -> Result<Option<StoredTask>, String> {
         .map_err(|error| error.to_string())
 }
 
+/// A task snapshot can recover its original URL when the SQLite file was lost
+/// after the video was downloaded but before META.json was written.
+pub fn read_snapshot(task_id: &str) -> Option<StoredTask> {
+    let path = jobs::inbox_root().join(task_id).join("job.json");
+    let raw = std::fs::read(path).ok()?;
+    let snapshot = serde_json::from_slice::<StoredTask>(&raw).ok()?;
+    (snapshot.task_id == task_id).then_some(snapshot)
+}
+
 pub fn delete(task_id: &str) -> Result<(), String> {
     let connection = connection()?;
     connection
@@ -328,15 +337,26 @@ pub fn bootstrap_existing_tasks() -> Result<(), String> {
             .ok()
             .and_then(|raw| serde_json::from_slice::<serde_json::Value>(&raw).ok())
             .unwrap_or_default();
-        let title = meta
-            .get("title")
-            .and_then(|value| value.as_str())
+        let snapshot = read_snapshot(&task_id);
+        let existing = get(&task_id)?;
+        let title = existing
+            .as_ref()
+            .map(|task| task.title.as_str())
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| meta.get("title").and_then(|value| value.as_str()))
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| snapshot.as_ref().map(|task| task.title.as_str()))
             .unwrap_or(&task_id);
-        let source_url = meta
-            .get("url")
-            .and_then(|value| value.as_str())
+        let source_url = existing
+            .as_ref()
+            .map(|task| task.source_url.as_str())
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| meta.get("url").and_then(|value| value.as_str()))
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| snapshot.as_ref().map(|task| task.source_url.as_str()))
             .unwrap_or_default();
-        if get(&task_id)?.is_some() {
+        if existing.is_some() {
+            ensure_task(&task_id, title, source_url)?;
             continue;
         }
         ensure_task(&task_id, title, source_url)?;

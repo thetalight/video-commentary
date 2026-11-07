@@ -8,11 +8,13 @@ use crate::state::AppState;
 pub async fn preview_local_voice(
     state: State<'_, AppState>,
     voice: String,
+    instruction: Option<String>,
 ) -> Result<String, String> {
     let voice = crate::services::tts::validate_voice(&voice)?.to_string();
     let _permit = state.acquire_render().await?;
     tauri::async_runtime::spawn_blocking(move || {
-        crate::services::tts::preview_voice(&voice)
+        let root=crate::services::jobs::inbox_root().join(".voice-previews");
+        crate::services::tts::cached_with_instruction("门外的脚步声停了。他没有开灯，只是慢慢放下了手里的钥匙。直到这一刻，他才发现，真正的危险从来不在门外。",&voice,instruction.as_deref().unwrap_or(crate::services::tts::DEFAULT_INSTRUCTION),&root.join("configured-preview"))
             .map(|path| path.to_string_lossy().into_owned())
             .map_err(|e| format!("本机音色试听失败：{e}。请在设置里选择已安装的中文音色。"))
     })
@@ -26,6 +28,11 @@ pub fn list_local_voices() -> Vec<crate::services::tts::LocalVoice> {
 }
 
 #[tauri::command]
+pub fn qwen_tts_ready() -> bool {
+    crate::services::tts::qwen_available()
+}
+
+#[tauri::command]
 pub async fn get_settings(state: State<'_, AppState>) -> Result<AppConfig, String> {
     state.get_config().await.map_err(|e| e.to_string())
 }
@@ -36,8 +43,15 @@ pub async fn save_settings(
     mut config: AppConfig,
 ) -> Result<(), String> {
     config.tts_voice = crate::services::tts::validate_voice(&config.tts_voice)?.to_string();
+    config.tts_instruction = config.tts_instruction.trim().to_string();
+    if config.tts_instruction.chars().count() > 500 {
+        return Err("朗读指令最多500字符".into());
+    }
     if config.source_caption_mask_percent > 40 {
         return Err("原字幕遮盖高度应为 0–40%".into());
+    }
+    if config.yfsp_min_duration_secs > 7200 {
+        return Err("一帆最短时长不能超过 120 分钟".into());
     }
     config.background_music_path = config.background_music_path.trim().to_string();
     if !config.background_music_path.is_empty() {

@@ -60,16 +60,16 @@ export default function App() {
         <div className="brand">
           <div className="brand-icon">解</div>
           <div>
-            <div className="eyebrow">VIDEO COMMENTARY STUDIO</div>
-            <h1>AI 整集解说</h1>
-            <p className="tagline">INGEST · FULL STORY · REVIEW · 16:9 RENDER</p>
+            <div className="eyebrow">STORYCUT / 解说工作台</div>
+            <h1>整集叙事工作室</h1>
+            <p className="tagline">一集故事 · 一篇全文 · 一条成片</p>
           </div>
         </div>
         <div className="header-system">
           <span className="system-dot" />
           <div>
-            <strong>AI DIRECTOR</strong>
-            <span>DeepSeek API · 字幕与文案文本会发送到配置的服务</span>
+            <strong>DEEPSEEK × QWEN TTS</strong>
+            <span>文本云端处理 · 配音本机生成</span>
           </div>
         </div>
       </header>
@@ -77,10 +77,10 @@ export default function App() {
       <main className="app-layout">
         <section className="work-panel queue-panel">
           <div className="panel-content">
-            <div className="eyebrow">01 · INGEST</div>
+            <div className="eyebrow">素材与任务</div>
             <div className="panel-intro">
               <h2>创建解说任务</h2>
-              <p>粘贴链接后，应用自动完成下载和字幕；随后统一梳理整集故事、写一篇连续稿，审稿后生成约原片30%时长的横屏解说。</p>
+              <p>导入片源，保留原语言字幕。统一写稿、审稿后生成横屏长解说。</p>
             </div>
 
             <div className="create-card">

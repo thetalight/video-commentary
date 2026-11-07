@@ -1,5 +1,7 @@
 # 整体架构与流程
 
+最新增量及边界见 [REMAINING_IMPLEMENTATION_STATUS.md](REMAINING_IMPLEMENTATION_STATUS.md)。声音归属通过可选audio_owner兼容扩展（省略默认旁白）；原声/留白只允许连续源区间且不用TTS。已有旁白试听、缓存片段恢复、候选切点、方案编辑和人工排除选择；下文提及的“尚未”原声/方案编辑状态以此增量表为准。内部timeline不是已验证剪映工程。
+
 ## 当前主流程
 
 **下载 → 平台/内封字幕 → 本机 whisper（可关闭） → 原语言字幕 → 中文全集索引 → 统一方案 → 全文写稿 → 事实与全文连贯性评审 → 人工审稿 → 本机配音 → 16:9横屏成片**。
@@ -14,13 +16,24 @@
 | `commands/episode.rs` | load/generate/save/review/render_episode，任务锁、源版本与全文版本检查 |
 | `services/episode.rs` | 全集索引、方案覆盖、全文或续写、双层评审、最多两轮局部修复、横屏字幕与出片 |
 | `prompts/episode/*.md` | index/story/write/review/repair 纯模型指令，编译内嵌 |
-| `services/script.rs` | 字幕锚定时间窗、证据引文与原速储备校验、实测配音镜头分配、字幕切分 |
+| `services/script.rs` | 字幕时间窗、独立文字证据校验、字幕切分；旧短片比例裁剪仅保留兼容 |
+| `services/edit_plan.rs` | v2独立证据/画面结构、必保区间、实测配音预算下的确定剪辑计划 |
 | `services/ai.rs / llm.rs` | 后端 DeepSeek 配置、JSON请求、字段级schema诊断与一次有限格式重试、结构化反序列化 |
 | `services/ffmpeg.rs` | 镜头原速拼接、混音、16:9等比缩放补边与字幕烧录；旧竖屏函数保留 |
 | `services/tts.rs / technical_review.rs` | 本机 say 内容缓存、估算字词时间、最终静音/黑场/静止检查 |
 | `components/EpisodePanel.tsx` | 一篇全文编辑、独立保存、重新评审、人工勾选确认与横屏视频 |
 
 路径均相对 `src-tauri/src/`，prompts 相对 `src-tauri/`，前端相对 `src/`。下载2、AI2、渲染1，同一任务互斥由后端控制。
+
+## 素材重试与字幕版本绑定
+
+下载前检查已有source.mp4：能探测但无效/低于一帆阈值，或容器探测失败时，移动至rejected-sources并记录原因、原身份/大小/时长；同步隔离source.*.part/.ytdl等旧续传片段，避免错误源续传。ffprobe缺失、无法启动或文件权限错误时明确报错、不移动文件。source-replacement.json先记录替换意图；不会删除旧字幕或稿件，但其版本不得自动关联新源。
+
+新规范字幕的TRANSCRIPT.source.json含binding_version、source_revision、transcript_revision和canonical_bytes_revision，数据库artifact.input_revision指向源版本。候选先质量检查，写TRANSCRIPT.install-pending.json，再原子保存已校验的规范字节、来源绑定和数据库artifact，最后清pending；任一中途失败则保留pending、禁止下游使用中间状态，重试重新获取。不是跨文件数据库事务，失败恢复采用fail-closed协议。
+
+生成/重评/迁移/出片材料入口和任务恢复均验证字幕绑定；源文件变化、字幕字节/内容不符、pending未清时不作为有效材料。历史缺绑定只在episode/shorts记录同时匹配原片revision和当前字幕revision时只读兼容，不在读取时写新绑定。退役翻译失败路径保留一个窄恢复例外：未发生已知源隔离/替换、原字幕质量合格且时间顺序符合旧安装链路时可经显式重试复用，再写当前绑定，不改原文字节。历史无绑定无法绝对证明来源，不能当普遍自动迁移许可。
+
+受管理、已替换源或pending任务缺少正式字幕时，不从根目录旧sidecar自动恢复；TRANSCRIPT.zh.srt等退役译文也不自动恢复。任务列表与工作台统一使用same_source_windows，容忍1ns以内JSON时间往返舍入，不容忍真实字幕/选片变化。
 
 ## 全集梳理与生成
 
@@ -34,8 +47,21 @@
 
 ## 评审、版本与保存
 
+工作台现在分为文稿/叙事方案/证据选片/试听出片四个区域，顶部显示当前稿件状态、字数/时长预算、主审稿按钮和持续运行反馈。有未保存改动时“保存并开始AI审稿”先保存、再用返回revision提交审稿；同步in-flight防重复点击。旧v1需升级、加载失败或素材忙时就地显示禁用原因，不静默置灰。审稿返回未通过显示候选与待核问题，不把IPC成功当评审通过。
+
+review_episode使用非等待任务锁，任务已有操作时立即明确拒绝；收到请求即发进度，校验后提示等待AI并发槽、开始审查、保存结果。素材读取/ffprobe移到blocking线程，不在异步IPC调度线程直接执行。AI长请求显示持续计时，不用前端假超时重开请求。UI合成回归测试见tests/episode-ui.html。
+
 DeepSeek JSON模式不强制schema。完整JSON若结构不符，后端给出schema自有字段路径及规则（最多4项），不回显实际值/未知字段名/正文；同一业务调用最多一次格式重试，仍须严格满足原schema。不把字符串ID强转、不丢额外字段或伪造缺失评审。HTTP、截断、工具调用、空正文或非法JSON不触发盲重试。错误标注全文评审/AI局部修稿/联网规划阶段。格式重试有额外API用量，但不新增业务修稿轮数，业务两轮上限不变。
 
+- 每轮先做唯一逐字引文指针修复：仅旁白、引文≥4有效字符、原文单窗唯一原样包含、现有证据ID合法时补漏引ID，不改叙述/引文/画面/保护、不做模糊或译文匹配；重复命中或无命中不猜。记录evidence-link-repairs-N.json及前后revision，不消耗AI业务修稿轮数也不自动批准事实。
+- 跨段画面重复先按冲突连通组统计画面并集、合计储备与缺口，不逐镜头重复报同一冲突。并集不足时，若无保护旁白段误选他段画面且自身已引用的字幕候选有未占用合法区间，程序可优先改用该段自己的证据候选；不改正文/证据、不猜无依据候选、不改原声/必保。并集充足时，可在原已选范围内有限分配互斥子区间。成功仍待完整AI复审，记录picture-allocation-repairs-N.json。无余量或分配失败不强行通过，picture_conflict_groups提供整组缺口及协同字数参考供AI按原文缩稿/有据补画面，不放宽画面不重复规则。
+- 单段画面储备不足时，程序可在原有选片之外补选该段已经引用、尚未被其他段播放的合法字幕候选，必须一次补足全部缺口才提交，并记录picture-reserve-repairs-N.json。原选画面、人工必保、正文和证据不变，仍待完整AI复审。全文事实修稿输入包含每段现有画面的字数预算，防止修稿扩写后把程序合格候选变为不合格。
+- 自动恢复写稿使用单一evidence源表和visual_candidate_ids，避免shots/evidence双份字幕占满请求。按实际输入大小和输出字数选择全文写作或逐节点接续，完整保留新稿前文及当前关联原证据；分块检查点保存源/字幕版本。最终仍对合并全文完整评审，超预算不截掉正文冒充通过。逐段suggestion和coherence显式severity="suggestion"仅保留可选措辞意见，事实、连贯性缺陷和程序错误仍须解决。
+- 审稿按显式paragraph_count/required_paragraph_indices覆盖每一段。合法报告缺段时保留coverage-completion-N.partial.json，并以缺段号为必填对象键请求一次真实事实补评，同时重新扫描同版本完整正文的coherence；合并全部事实和新旧全文问题后再校验。补评不代填pass、不改稿、不重开局部修复轮数；失败作为review_service异常，可点补全审稿，不能据此让用户改文案或自动重写全文。同源、同字幕、同方案且plan revision相同的历史部分报告可复用，记录coverage-resume.json；其余版本不复用。
+- 事实审稿同时提供paragraph_registry和paragraph_texts（机器段号到正文映射），修稿提供每段独立负责的节点。丢主线修稿退回并用剩余轮次修正。纯字数缺口逐段筛选短句方案，只对未解决段做一次带实测字数的focused-shorten纠正，保留合格文字、证据和保护点，组装后全文复审。完整报告复用要求paragraph-text-map-v3；旧部分报告若问题证据与所指段完全错开则重新评审。
+- 已真实通过的候选可导出version=1候选包（base_revision/episode/audit_revision/audit），由import_reviewed_episode在任务锁内验证原稿版本、材料/方案、正文哈希与完整评审后恢复；归档before/verified-package/accepted并通过正常save保存，不直接编辑任务文件或伪造通过。导入不调用AI、不自动确认出片。
+- 生成和重评入口均接入一次自动全文恢复：局部修复耗尽/无进展等内容失败时，复用原字幕、原片和统一方案，携带失败报告重写全文，重新程序检查与完整AI评审；恢复稿最多两轮局部修复，不能再次启动全文恢复。runs/*/recovery保存before/draft/candidate/result及独立review记录；恢复通过才替换原候选，否则保留原稿并标异常。人工必保/原声安排不自动重写，网络/鉴权失败不触发重写。此流程不自动代替人工出片确认，也不是通用崩溃续跑。
+- 每轮先程序preflight。已知引文/画面问题直接进入授权段号定向修复，program-issues-N.json列出全部规则错误、从0起模型段号/从1起界面段号、候选真实边界和缺少储备秒数，不只给第一个错误；不等待全文评审格式成功；修复计入同一全局两轮预算，程序合格后仍必须完整事实/连贯性复审才可通过。结构或主线覆盖问题若无局部可修段则明确返回，不擅自自由重写。连贯性项必填reason/paragraph_indices，允许已声明的suggestion/category/severity/evidence_ids补充字段（证据ID仍校验），不通过丢弃任意字段放行。
 - 每轮同一请求检查所有段落事实和全文连贯性，携带完整正文、方案、事件索引与关联原字幕证据。超过应用预算就明确标未通过，不只看摘要冒充全文。
 - 事实每段恰好一结论；pass须有证据，insufficient_evidence进入修稿（补查相邻字幕、纠正/收窄/删去无证据从句），不再立即终止。全文问题定位一个或多个段号，支持接点两侧联动修复。
 - 合并程序/事实/连贯性问题，只替换允许段，base_revision匹配；标题/段数/其他段冻结。最多两轮、三次评审，无变化、越权或无效评审停止；问题增多不会提前终止，但没有额外轮数。保留程序合格且问题较少候选，未通过不得出片。
@@ -54,15 +80,25 @@ TAVILY_API_KEY从同一后端.env读取；缺失时不搜索但审稿/修稿继�
 
 ## 原速16:9出片
 
-出片必须当前全文评审版本一致、程序校验通过、IPC收到人工确认。say新合成与缓存音轨先独立解码并检查能量/静音（-50dB、0.2秒检测，边缘≥2秒/内部≥3秒静音阻断；近乎全静音亦阻断），缓存旁保存audio-review.json。渲染再在混音前保存narration-review-NNNN.json；BGM或原声无法替缺失旁白过关。这不验证朗读语义、错漏字或全文读出，报告semantic_coverage_verified=false，纯音同样可能能量通过，不虚称语音识别。say逐段完整合成，按实测时长从同情节字幕窗原速截取；画面不够或任一截取<1秒失败，不裁配音、不改速。配音响度归一、原声侧链避让，可混本地BGM。
+出片必须当前全文评审版本一致、程序校验通过、IPC收到人工确认。say新合成与缓存音轨先独立解码并检查能量/静音（-50dB、0.2秒检测，边缘≥2秒/内部≥3秒静音阻断；近乎全静音亦阻断），缓存旁保存audio-review.json。渲染再在混音前保存narration-review-NNNN.json；BGM或原声无法替缺失旁白过关。这不验证朗读语义、错漏字或全文读出，报告semantic_coverage_verified=false，纯音同样可能能量通过，不虚称语音识别。say逐段完整合成，按实测时长编译带必保约束的独立edit-plan后原速截取；画面不够或任一截取<1秒失败，不裁配音、不改速。配音响度归一、原声侧链避让，可混本地BGM。
 
 合并为一条连续音画，裁掉设置中的原片底部字幕条（可为0），等比缩放补边到1920×1080，不拉伸、不再用模糊竖屏背景或全程顶部标题。解说字幕白字居底，按实测音频时长估算，不是词级强制对齐。
 
 异常区间按日志事件顺序配对，孤立end不错配后续start；freeze/silence/black在EOF未闭合的start按实际媒体时长闭合，纳入报告。最终视频与配音累计时长差>0.5秒阻断；在加BGM和烧字幕后的实际最终视频检查静音、黑场、静止。静音阻断，黑场/静止提示；最终技术检查不证明内容、画面匹配、字幕位置或混音听感都正确，仍须人完整看片与只听声音。
 
-## 短证据与下一批边界
+## schema-v2：独立证据、画面与必保区间
 
-script::validate_evidence独立检查原文/引用，短于0.8秒的否定回复不失去证据资格；短引文仅在等于完整引用窗原文时允许。现有validate/timing仍按共用shot_ids校验画面（窗口≥0.8秒、最终裁剪≥1秒及≥4有效字符引文），不为通过放宽剪辑时长。半秒否定句可入索引并通过独立文字检查，但选为画面仍阻断；真正独立evidence_refs与candidate_visual_ids要下一批显式schema迁移，当前未假装完成。
+新生成使用schema_version=2，段落字段仅narration/evidence_quote/evidence_refs/visual_selections。证据可短于0.8秒、可跨段重复引用；短引文仅在等于完整所引字幕窗原文时允许。画面选择独立包含candidate_id/start/end/must_keep_ranges，必须在该候选源区间内、至少1秒、段内有序且全稿不重复重叠，累计储备≥文案字符数×0.3。短否定证据可引用，另选同情节完整画面，不改变证据时间。
+
+候选仍为字幕关联时间窗，不是视觉分镜；未引入镜头检测/VLM，相关性由文本证据审查与人工看片核对。AI新建必保只能恰好对应所引完整字幕窗，不可凭字幕猜动作精确秒点；人工可实际看片后标秒级动作区间。自动修稿必须保留所有已有必保区间，不能删保护来消除冲突；人工修改需要重新评审。
+
+所有段配音与独立音轨检查完成后，compile生成edit-plan.json，绑定源/字幕/全文revision、各段实测音频长度、输出累计位置和原片裁剪区间。全部候选各1秒超出配音预算时，anchor-envelope-optional-reserve-v2保留所有必保片段，从已审储备中选择容量足够且数量最少的无保护子集，优先原源顺序；omitted_candidate_ids记录未播候选。不改文稿、证据或原始选择，实际镜头仍≥1秒。选定后先保障必保包络与最短镜头，再分配剩余时长，围绕保护包络或无保护画面中心裁剪。真正短于必保/最少可行镜头、配音长于储备或实际范围重叠时保存冲突并停止；不定格慢放、不截保护。FFmpeg只执行计划。
+
+该计划目前使用秒级源范围，不做VFR逐帧/语句边界吸附；ffmpeg仍统一30fps，边界有编码帧量化，不能宣称完整动作/对白或自然接点均已保证。原声主导段、留白、多轨timeline、真实视觉镜头索引是后续工作。
+
+v1以只读投影显示，原shot_ids意义不改变；迁移独立面板先调用只读episode_migration_status，直接区分可迁移/字幕变化/原片变化/选片范围变化。材料不一致时显示重新生成入口；页面内二次确认重新生成及API用量，不依赖WebView confirm弹窗。迁移显式勾选后发一次请求，有就地忙碌/失败/超时等待提示，成功切换v2并显示后续操作；后端任务忙会立即拒绝，不排队等待长AI任务。合成点击测试见tests/migration-ui.html。
+
+可显式migrate_episode，原v1完整归档schema-v1-original.json，再分别复制证据ID和全窗画面（不猜保护点）写v2，清除评审、研究和输出引用。材料/排除改变时拒绝迁移，须重新生成。旧JSON不在读取时改写。修改正文、证据、画面或保护点都会改变全文revision，使旧评审和输出失效；渲染额外核对revision与当前内容。
 
 无额外模型，本批仅规则/现有FFmpeg检查；视觉/WhisperX/说话人/新增文本模型须先请示用户再引入。
 
@@ -74,7 +110,7 @@ episode/
   runs/generate-*/                 # index-*.json / story.json / draft-checkpoint.json / review/
   runs/review-*/                   # before.json / candidate / audit / repair / result
   tts/                            # 按文案音色缓存
-  renders/run-*/                  # episode.mp4 / .srt / .ass / technical-review.json
+  renders/run-*/                  # edit-plan.json / narration-review-*.json / episode.mp4 / .srt / .ass / technical-review.json
 ```
 
 `shorts/` 及旧命令保留供兼容，不被新生成覆盖。队列暂复用 shorts_total/shorts_rendered IPC字段存一条episode计数，主界面不再显示旧短片入口。生成/渲染失败留下诊断目录但不写成功 output_path。正文检查点尚无自动恢复协议，重试生成会新建run；已校验索引块可跨run缓存复用，音频缓存可复用，部分视频不自动复用。

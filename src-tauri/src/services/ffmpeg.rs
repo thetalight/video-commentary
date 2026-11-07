@@ -547,6 +547,70 @@ pub fn narration_montage(
     run_cmd(Command::new(ffmpeg).args(args))
 }
 
+/// Explicit original-dialogue/action or silent beat, exactly one native-speed range.
+pub fn source_beat(
+    source: &Path,
+    start: f64,
+    end: f64,
+    output: &Path,
+    width: u32,
+    height: u32,
+    keep_audio: bool,
+) -> Result<(), FfmpegError> {
+    let ffmpeg = resolve_ffmpeg_bin().ok_or(FfmpegError::NotFound)?;
+    let audio = has_audio(source);
+    if keep_audio && !audio {
+        return Err(FfmpegError::Failed("原声主导段的源文件没有音轨".into()));
+    }
+    let mut cmd = Command::new(ffmpeg);
+    cmd.args([
+        "-y",
+        "-ss",
+        &format!("{start:.6}"),
+        "-t",
+        &format!("{:.6}", end - start),
+        "-i",
+    ])
+    .arg(source);
+    if !keep_audio {
+        cmd.args(["-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo"]);
+    }
+    cmd.args(["-map","0:v:0","-map",if keep_audio{"0:a:0"}else{"1:a:0"},"-vf",&format!("fps=30,scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p"),"-af","aresample=48000,aformat=channel_layouts=stereo","-t",&format!("{:.6}",end-start),"-c:v","libx264","-preset","fast","-crf","16","-c:a","aac","-b:a","192k","-ar","48000","-ac","2"]).arg(output);
+    run_cmd(&mut cmd)
+}
+
+pub fn concat_audio(inputs: &[PathBuf], output: &Path) -> Result<(), FfmpegError> {
+    let ffmpeg = resolve_ffmpeg_bin().ok_or(FfmpegError::NotFound)?;
+    if inputs.is_empty() {
+        return Err(FfmpegError::Failed("没有可预览的旁白".into()));
+    }
+    let mut cmd = Command::new(ffmpeg);
+    cmd.arg("-y");
+    for input in inputs {
+        cmd.arg("-i").arg(input);
+    }
+    let mut filter = String::new();
+    for i in 0..inputs.len() {
+        filter.push_str(&format!(
+            "[{i}:a]aresample=48000,aformat=channel_layouts=stereo,asetpts=PTS-STARTPTS[a{i}];"
+        ));
+    }
+    for i in 0..inputs.len() {
+        filter.push_str(&format!("[a{i}]"));
+    }
+    filter.push_str(&format!("concat=n={}:v=0:a=1[a]", inputs.len()));
+    cmd.args([
+        "-filter_complex",
+        &filter,
+        "-map",
+        "[a]",
+        "-c:a",
+        "pcm_s16le",
+    ])
+    .arg(output);
+    run_cmd(&mut cmd)
+}
+
 pub fn concat_videos(inputs: &[PathBuf], output_path: &Path) -> Result<(), FfmpegError> {
     let ffmpeg = resolve_ffmpeg_bin().ok_or(FfmpegError::NotFound)?;
     if inputs.is_empty() {
@@ -796,6 +860,30 @@ pub fn compose_vertical(
     }
     fs::rename(pending_output, output_path)?;
     Ok(())
+}
+
+pub fn mute_intervals(
+    video: &Path,
+    output: &Path,
+    ranges: &[(f64, f64)],
+) -> Result<(), FfmpegError> {
+    let ffmpeg = resolve_ffmpeg_bin().ok_or(FfmpegError::NotFound)?;
+    let filter = ranges
+        .iter()
+        .map(|(a, b)| format!("volume=0:enable='gte(t,{a:.6})*lt(t,{b:.6})'"))
+        .collect::<Vec<_>>()
+        .join(",");
+    run_cmd(
+        Command::new(ffmpeg)
+            .arg("-y")
+            .arg("-i")
+            .arg(video)
+            .args([
+                "-map", "0:v:0", "-map", "0:a:0", "-c:v", "copy", "-af", &filter, "-c:a", "aac",
+                "-ar", "48000", "-ac", "2",
+            ])
+            .arg(output),
+    )
 }
 
 fn landscape_filter(mask_percent: u32) -> String {

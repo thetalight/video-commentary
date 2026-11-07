@@ -1,5 +1,9 @@
 # Third-party notices
 
+## Optional Qwen3-TTS / MLX local speech runtime
+
+The independent offline adapter can use [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS) CustomVoice weights (Apache-2.0) through [mlx-audio](https://github.com/Blaizzy/mlx-audio) (MIT). The optional installer pins mlx-audio 0.6.4 and the approved MLX checkpoint revision. Model weights and Python dependencies are installed separately in the user's application-data directory, not distributed in this repository. Preserve upstream licenses when redistributing those components; see docs/QWEN_TTS.md.
+
 ## Rig (rig-core 0.42.0)
 
 The DeepSeek text-generation adapter depends on [Rig](https://github.com/0xPlaygrounds/rig), under the MIT License.

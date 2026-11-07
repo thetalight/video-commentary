@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { episodeExclusions, revealPath } from "../lib/api";
+import { episodeExclusions, saveEpisodeExclusions, revealPath } from "../lib/api";
 import type { QueueTaskStatus } from "../hooks/taskQueueShared";
 import type { ExclusionReport, PrepareResult, TaskProgress } from "../lib/types";
 import { StatusStepper } from "./StatusStepper";
@@ -30,27 +30,29 @@ export function EpisodeWorkspace({
 }: EpisodeWorkspaceProps) {
   const running = status === "running";
   const [exclusions, setExclusions] = useState<ExclusionReport | null>(null);
+  const [exclusionChoices,setExclusionChoices]=useState<number[]>([]);
+  const [savingExclusions,setSavingExclusions]=useState(false);
   const [exclusionError, setExclusionError] = useState("");
   async function refreshExclusions() {
     setExclusionError("");
-    try { setExclusions(await episodeExclusions(prepare.task_id)); }
+    try { const report=await episodeExclusions(prepare.task_id); setExclusions(report);setExclusionChoices(report.candidates.flatMap((c,i)=>c.applied?[i]:[])); }
     catch { setExclusions(null); setExclusionError("无法读取当前排除报告，请刷新后再生成。旧素材准备时的范围不一定仍有效。"); }
   }
   useEffect(() => {
     let active = true;
     setExclusions(null); setExclusionError("");
-    episodeExclusions(prepare.task_id).then(value => { if (active) setExclusions(value); })
+    episodeExclusions(prepare.task_id).then(value => { if (active) {setExclusions(value);setExclusionChoices(value.candidates.flatMap((c,i)=>c.applied?[i]:[]));} })
       .catch(() => { if (active) setExclusionError("无法读取当前排除报告，请刷新后重试。"); });
     return () => { active = false; };
   }, [prepare.task_id, prepare.transcript_path]);
 
   return (
-    <section className="review-panel director-stage">
-      <div className="eyebrow">EPISODE DIRECTOR</div>
+    <section className="review-panel episode-workspace">
+      <div className="eyebrow">当前任务</div>
       <div className="panel-intro">
         <h2>{prepare.title}</h2>
         <p>
-          原片和字幕（{prepare.subtitle_source}）已就绪。确认后端 DeepSeek API 已配置后，梳理整集并生成一篇连续解说稿，经事实和全文连贯性评审、人工审稿后生成16:9横屏长视频。
+          {prepare.subtitle_source}已就绪 · 原片 {formatTime(prepare.duration_secs)} · 目标约 {formatTime(prepare.duration_secs * 0.3)}
         </p>
       </div>
 
@@ -63,6 +65,7 @@ export function EpisodeWorkspace({
         onRenderedChange={onRenderedChange}
       />
 
+      <details className="source-tools"><summary>原片、字幕与排除设置 · 辅助工具</summary>
       <VideoPreview sourcePath={prepare.source_path} />
       <TranscriptViewer taskId={prepare.task_id} source={prepare.subtitle_source} />
 
@@ -74,8 +77,13 @@ export function EpisodeWorkspace({
         {exclusions && <>
           <p>原始 {exclusions.original_cue_count} 条 · 保留 {exclusions.retained_cue_positions.length} 条 · 排除 {exclusions.excluded_cue_positions.length} 条 · 规则 {exclusions.policy_version}</p>
           {exclusions.candidates.length === 0 && <p>没有候选排除区间，保留全部有效字幕材料。</p>}
+          <button type="button" disabled={running||savingExclusions} onClick={async()=>{
+            if (!window.confirm("确认这些候选排除选择？如果材料变化，旧稿将只能查看并需重新生成；原字幕不修改。"))return;
+            setSavingExclusions(true);setExclusionError("");
+            try{const report=await saveEpisodeExclusions(prepare.task_id,exclusions.candidate_fingerprint,exclusionChoices);setExclusions(report);setExclusionError("选择已保存。若材料变化请重新选择任务并生成整集，旧稿不自动覆盖。");}catch(e){setExclusionError(String(e));}finally{setSavingExclusions(false);}
+          }}>确认逐区间排除选择</button>
           {exclusions.candidates.map((candidate,index) => <p key={index}>
-            {candidate.applied ? "已按设置排除" : "候选未排除"} · {candidate.range.kind} · {formatTime(candidate.range.start)}–{formatTime(candidate.range.end)} · 字幕#{candidate.cue_index} · {candidate.reason}
+            <input type="checkbox" disabled={running||savingExclusions} checked={exclusionChoices.includes(index)} onChange={e=>setExclusionChoices(current=>e.target.checked?[...current,index]:current.filter(i=>i!==index))} />{candidate.applied ? "当前已排除" : "当前保留"} · {candidate.range.kind} · {formatTime(candidate.range.start)}–{formatTime(candidate.range.end)} · 字幕#{candidate.cue_index} · {candidate.reason}
           </p>)}
         </>}
       </details>
@@ -92,6 +100,7 @@ export function EpisodeWorkspace({
           打开任务目录
         </button>
       </div>
+      </details>
     </section>
   );
 }

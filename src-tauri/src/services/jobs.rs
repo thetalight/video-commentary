@@ -102,6 +102,15 @@ fn normalize_canonical_names(paths: &JobPaths) -> io::Result<()> {
 }
 
 fn restore_canonical_transcript(root: &Path, transcript: &Path) -> io::Result<()> {
+    // A missing canonical file under a managed/bound task is not permission to
+    // resurrect a stale sidecar (possibly from a rejected source or old translation).
+    if root.join("source-replacement.json").exists()
+        || root.join("rejected-sources").exists()
+        || root.join("TRANSCRIPT.install-pending.json").exists()
+        || root.join("TRANSCRIPT.source.json").exists()
+    {
+        return Ok(());
+    }
     let mut candidates = fs::read_dir(root)?
         .filter_map(Result::ok)
         .map(|entry| entry.path())
@@ -117,6 +126,7 @@ fn restore_canonical_transcript(root: &Path, transcript: &Path) -> io::Result<()
                         && !lower.contains("whisper")
                         && !lower.contains(".asr.")
                         && !lower.contains(".ocr.")
+                        && !lower.starts_with("transcript.")
                 })
         })
         .collect::<Vec<_>>();
@@ -488,6 +498,36 @@ mod tests {
             b"selected simplified subtitle"
         );
         let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn managed_or_replaced_task_never_resurrects_unbound_old_sidecar() {
+        let root = std::env::temp_dir().join(format!(
+            "vc-no-restore-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let canonical = root.join("TRANSCRIPT.srt");
+        std::fs::write(root.join("source.embedded.en.srt"), b"old sidecar").unwrap();
+        for marker in [
+            "source-replacement.json",
+            "TRANSCRIPT.install-pending.json",
+            "TRANSCRIPT.source.json",
+        ] {
+            std::fs::write(root.join(marker), b"marker").unwrap();
+            restore_canonical_transcript(&root, &canonical).unwrap();
+            assert!(!canonical.exists());
+            std::fs::remove_file(root.join(marker)).unwrap();
+        }
+        std::fs::remove_file(root.join("source.embedded.en.srt")).unwrap();
+        std::fs::write(root.join("TRANSCRIPT.zh.srt"), b"retired translated copy").unwrap();
+        restore_canonical_transcript(&root, &canonical).unwrap();
+        assert!(!canonical.exists());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -4,6 +4,7 @@ import type {
   DependencyStatus,
   ExistingJob,
   Episode,
+  EpisodeScript,
   ExclusionReport,
   LocalVoice,
   AiStatus,
@@ -21,6 +22,7 @@ export const refetchSubtitles = (taskId: string) =>
   invoke<PrepareResult>("refetch_subtitles", { taskId });
 export const deleteJob = (taskId: string) => invoke<void>("delete_job", { taskId });
 export const revealPath = (path: string) => invoke<void>("reveal_path", { path });
+export const revealInFinder = (path: string) => invoke<void>("reveal_in_finder", { path });
 
 export const loadShorts = (taskId: string) =>
   invoke<ShortsBundle | null>("load_shorts", { taskId });
@@ -35,21 +37,30 @@ export const renderShort = (
   expectedRevision: string,
 ) => invoke<ShortsBundle>("render_short", { taskId, shortId, plan, expectedRevision });
 
+export const saveEpisodeExclusions = (taskId:string, expectedFingerprint:string, appliedIndices:number[]) => invoke<ExclusionReport>("save_episode_exclusions", { taskId, expectedFingerprint, appliedIndices });
 export const episodeExclusions = (taskId: string) => invoke<ExclusionReport>("episode_exclusions", { taskId });
 export const loadEpisode = (taskId: string) => invoke<Episode | null>("load_episode", { taskId });
 export const generateEpisode = (taskId: string, expectedRevision: string | null) =>
   invoke<Episode>("generate_episode", { taskId, expectedRevision });
-export const saveEpisode = (taskId: string, plan: ShortScript, expectedRevision: string) =>
+export const episodeMigrationStatus = (taskId:string,expectedRevision:string) => invoke<{ can_migrate:boolean; reason:string }>("episode_migration_status",{taskId,expectedRevision});
+export const migrateEpisode = (taskId: string, expectedRevision: string) => invoke<Episode>("migrate_episode", { taskId, expectedRevision });
+export const saveEpisode = (taskId: string, plan: EpisodeScript, expectedRevision: string) =>
   invoke<Episode>("save_episode", { taskId, plan, expectedRevision });
+export const detectEpisodeScenes = (taskId: string) => invoke<{ cut_candidates:number[]; warnings:string[] }>("detect_episode_scenes", { taskId });
+export const previewEpisodeNarration = (taskId: string, expectedRevision: string) => invoke<string>("preview_episode_narration", { taskId, expectedRevision });
+export const saveEpisodeStory = (taskId: string, expectedRevision: string, expectedStory: Episode["story"], story: Episode["story"]) => invoke<Episode>("save_episode_story", { taskId, expectedRevision, expectedStory, story });
 export const reviewEpisode = (taskId: string, expectedRevision: string) =>
   invoke<Episode>("review_episode", { taskId, expectedRevision });
+export const importReviewedEpisode = (taskId: string, expectedRevision: string, candidatePath: string, acceptStoryChange = false) =>
+  invoke<Episode>("import_reviewed_episode", { taskId, expectedRevision, candidatePath, acceptStoryChange });
 export const renderEpisode = (taskId: string, expectedRevision: string, confirmedReview: boolean) =>
   invoke<Episode>("render_episode", { taskId, expectedRevision, confirmedReview });
 
+export const qwenTtsReady = () => invoke<boolean>("qwen_tts_ready");
 export const getSettings = () => invoke<AppConfig>("get_settings");
 export const saveSettings = (config: AppConfig) => invoke<void>("save_settings", { config });
 export const checkAi = () => invoke<AiStatus>("check_ai");
 export const checkDependencies = () => invoke<DependencyStatus>("check_dependencies");
-export const previewLocalVoice = (voice: string) =>
-  invoke<string>("preview_local_voice", { voice });
+export const previewLocalVoice = (voice: string, instruction?: string) =>
+  invoke<string>("preview_local_voice", { voice, instruction });
 export const listLocalVoices = () => invoke<LocalVoice[]>("list_local_voices");

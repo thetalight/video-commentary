@@ -3,6 +3,7 @@ import {
   checkDependencies,
   checkAi,
   getSettings,
+  qwenTtsReady,
   listLocalVoices,
   saveSettings,
 } from "../lib/api";
@@ -13,6 +14,7 @@ import { LocalVoiceSelector } from "./LocalVoiceSelector";
 export function Settings() {
   const [config, setConfig] = useState<AppConfig | null>(null);
   const [deps, setDeps] = useState<DependencyStatus | null>(null);
+  const [qwenReady, setQwenReady] = useState(false);
   const [voices, setVoices] = useState<LocalVoice[]>([]);
   const [saved, setSaved] = useState(false);
   const [open, setOpen] = useState(false);
@@ -24,6 +26,7 @@ export function Settings() {
     getSettings().then(setConfig);
     checkDependencies().then(setDeps);
     listLocalVoices().then(setVoices);
+    qwenTtsReady().then(setQwenReady);
   }, []);
 
   if (!config) return null;
@@ -134,8 +137,13 @@ export function Settings() {
           <div className="settings-grid">
             <label>AI 运行方式<input value="DeepSeek API（后端 .env 配置）" disabled /></label>
 
-            <LocalVoiceSelector voice={config.tts_voice} voices={voices} onChange={voice => setConfig({ ...config, tts_voice: voice })} />
+            <p role="status">Qwen3-TTS 1.7B CustomVoice / MLX：{qwenReady ? "隔离环境及完整权重已就绪，请试听确认" : "尚未就绪，请运行安装脚本或等待完整权重下载；不会回退say"}</p>
+            <LocalVoiceSelector voice={config.tts_voice} instruction={config.tts_instruction} voices={voices} onChange={voice => setConfig({ ...config, tts_voice: voice })} />
 
+            <label className="span-2">Qwen朗读风格指令（不作为正文朗读）
+              <textarea rows={3} maxLength={500} value={config.tts_instruction ?? ""} onChange={e=>setConfig({...config,tts_instruction:e.target.value})}/>
+              <small>仅qwen3音色使用；例如“沉稳叙述，略带悬念，不喊叫”。改变指令会产生新的配音缓存；say不支持情绪指令。默认新任务音色为qwen3:Uncle_Fu，已有设置需手动选择并保存。</small>
+            </label>
             <label className="span-2">本地背景音乐（可选，留空不添加）
               <input
                 type="text"
@@ -226,6 +234,23 @@ export function Settings() {
                 <option value="brave">Brave</option>
                 <option value="edge">Edge</option>
               </select>
+            </label>
+
+            <label>
+              一帆正片最短时长
+              <select
+                value={config.yfsp_min_duration_secs}
+                onChange={(e) =>
+                  setConfig({ ...config, yfsp_min_duration_secs: Number(e.target.value) })
+                }
+              >
+                <option value={0}>关闭时长检查</option>
+                <option value={300}>5 分钟</option>
+                <option value={600}>10 分钟（默认）</option>
+                <option value={1200}>20 分钟</option>
+                <option value={1800}>30 分钟</option>
+              </select>
+              <small>用于拦截误下的预览片；短剧可调低。设置对后续下载和任务恢复生效。</small>
             </label>
 
             <label className="span-2">

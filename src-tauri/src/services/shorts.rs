@@ -96,6 +96,7 @@ pub struct Draft {
 
 pub struct RenderSettings {
     pub voice: String,
+    pub instruction: String,
     pub mask_percent: u32,
     /// Linear gain of the source soundtrack under narration; 0 mutes it.
     pub ambience: f64,
@@ -479,8 +480,13 @@ pub fn render(
             plan.paragraphs.len()
         ));
         let key = jobs::stable_hash(&[p.narration.as_bytes(), settings.voice.as_bytes()]);
-        let audio = tts::cached_or_synthesize(&p.narration, &settings.voice, &tts_cache.join(key))
-            .map_err(|e| e.to_string())?;
+        let audio = tts::cached_with_instruction(
+            &p.narration,
+            &settings.voice,
+            &settings.instruction,
+            &tts_cache.join(key),
+        )
+        .map_err(|e| e.to_string())?;
         let duration = ffmpeg::get_duration(&audio).map_err(|e| e.to_string())?;
         let shots: Vec<_> = p
             .shot_ids
@@ -701,6 +707,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("vc-render-smoke-{}", std::process::id()));
         let settings = RenderSettings {
             voice: "Tingting".into(),
+            instruction: tts::DEFAULT_INSTRUCTION.into(),
             mask_percent: 18,
             ambience: 0.0,
             music: None,

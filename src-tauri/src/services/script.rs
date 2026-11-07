@@ -42,6 +42,21 @@ impl Script {
     }
 }
 
+/// Compare source windows structurally. SRT resolution is milliseconds; tolerate
+/// only sub-nanosecond JSON floating-point roundoff, never cue/selection changes.
+pub fn same_source_windows(saved: &[Shot], current: &[Shot]) -> bool {
+    fn same_time(a: f64, b: f64) -> bool {
+        a.is_finite() && b.is_finite() && (a - b).abs() <= 1e-9
+    }
+    saved.len() == current.len()
+        && saved.iter().zip(current).all(|(a, b)| {
+            a.id == b.id
+                && a.text == b.text
+                && same_time(a.start, b.start)
+                && same_time(a.end, b.end)
+        })
+}
+
 pub fn transcript_revision(entries: &[SubtitleEntry]) -> String {
     jobs::stable_hash(&[&serde_json::to_vec(entries).unwrap_or_default()])
 }
@@ -352,6 +367,31 @@ mod tests {
             end,
             text: "父亲离开以后没有回来".into(),
         }
+    }
+
+    #[test]
+    fn source_window_comparison_tolerates_only_json_roundoff_not_real_edits() {
+        let original = vec![Shot {
+            id: 0,
+            start: 310.253,
+            end: 320.844,
+            text: "synthetic".into(),
+        }];
+        let mut other = original.clone();
+        other[0].start += 5.684341886080802e-14;
+        assert!(same_source_windows(&original, &other));
+        other[0].start += 0.001;
+        assert!(!same_source_windows(&original, &other));
+        other = original.clone();
+        other[0].text.push('x');
+        assert!(!same_source_windows(&original, &other));
+        other = original.clone();
+        other[0].id = 1;
+        assert!(!same_source_windows(&original, &other));
+        other = original.clone();
+        other[0].end = f64::NAN;
+        assert!(!same_source_windows(&original, &other));
+        assert!(!same_source_windows(&original, &[]));
     }
 
     #[test]

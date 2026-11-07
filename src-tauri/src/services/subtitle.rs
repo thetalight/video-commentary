@@ -367,6 +367,7 @@ pub struct ExclusionCandidate {
 }
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ExclusionReport {
+    pub candidate_fingerprint: String,
     pub policy_version: String,
     pub source_duration: f64,
     pub original_cue_count: usize,
@@ -455,7 +456,8 @@ pub fn exclusion_report(
             .iter()
             .any(|range| start < range.end && end > range.start)
     });
-    ExclusionReport {
+    let mut report = ExclusionReport {
+        candidate_fingerprint: String::new(),
         policy_version: "marker-local-v2".into(),
         source_duration: duration,
         original_cue_count: entries.len(),
@@ -471,7 +473,67 @@ pub fn exclusion_report(
         applied_ranges,
         excluded_cue_positions,
         retained_cue_positions,
+    };
+    report.candidate_fingerprint = exclusion_fingerprint(&report);
+    report
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ExclusionChoices {
+    pub version: u32,
+    pub transcript_revision: String,
+    pub candidate_fingerprint: String,
+    pub applied_indices: Vec<usize>,
+}
+pub fn exclusion_fingerprint(report: &ExclusionReport) -> String {
+    crate::services::jobs::stable_hash(&[
+        report.policy_version.as_bytes(),
+        &serde_json::to_vec(
+            &report
+                .candidates
+                .iter()
+                .map(|c| (&c.range, c.cue_index, &c.method))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap_or_default(),
+    ])
+}
+pub fn apply_exclusion_choices(
+    report: &mut ExclusionReport,
+    choices: &ExclusionChoices,
+    transcript_revision: &str,
+) -> Result<(), String> {
+    if choices.version != 1
+        || choices.transcript_revision != transcript_revision
+        || choices.candidate_fingerprint != exclusion_fingerprint(report)
+    {
+        return Err("人工排除选择对应旧字幕或检测规则，请重新确认候选区间".into());
     }
+    let set: std::collections::HashSet<_> = choices.applied_indices.iter().copied().collect();
+    if set.len() != choices.applied_indices.len()
+        || set.iter().any(|i| *i >= report.candidates.len())
+    {
+        return Err("人工排除候选编号无效或重复".into());
+    }
+    for (i, c) in report.candidates.iter_mut().enumerate() {
+        c.applied = set.contains(&i);
+    }
+    report.applied_ranges = merge_ranges(
+        report
+            .candidates
+            .iter()
+            .filter(|c| c.applied)
+            .map(|c| c.range.clone())
+            .collect(),
+    );
+    let (excluded, retained) = (0..report.original_ranges.len()).partition(|i| {
+        report.applied_ranges.iter().any(|r| {
+            report.original_ranges[*i].start < r.end && report.original_ranges[*i].end > r.start
+        })
+    });
+    report.excluded_cue_positions = excluded;
+    report.retained_cue_positions = retained;
+    Ok(())
 }
 
 pub fn detect_excluded_ranges(
@@ -720,6 +782,26 @@ mod tests {
         let disabled = exclusion_report(&entries, 2700.0, false, false);
         assert_eq!(disabled.candidates.len(), 2);
         assert!(disabled.applied_ranges.is_empty());
+    }
+
+    #[test]
+    fn manual_candidate_choices_are_bound_to_subtitles_and_detection_fingerprint() {
+        let entries = vec![entry(1, 2.0, 4.0, "♪"), entry(2, 8.0, 10.0, "作词：某人")];
+        let mut report = exclusion_report(&entries, 2700.0, true, false);
+        let choices = ExclusionChoices {
+            version: 1,
+            transcript_revision: "current".into(),
+            candidate_fingerprint: exclusion_fingerprint(&report),
+            applied_indices: vec![0],
+        };
+        apply_exclusion_choices(&mut report, &choices, "current").unwrap();
+        assert!(report.candidates[0].applied);
+        assert!(!report.candidates[1].applied);
+        assert_eq!(report.excluded_cue_positions, vec![0]);
+        assert!(apply_exclusion_choices(&mut report, &choices, "changed").is_err());
+        let mut invalid = choices;
+        invalid.applied_indices = vec![9];
+        assert!(apply_exclusion_choices(&mut report, &invalid, "current").is_err());
     }
 
     #[test]

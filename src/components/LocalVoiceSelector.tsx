@@ -3,8 +3,9 @@ import { convertFileSrc } from "@tauri-apps/api/core";
 import { previewLocalVoice } from "../lib/api";
 import type { LocalVoice } from "../lib/types";
 
-export function LocalVoiceSelector({ voice, voices, onChange }: {
+export function LocalVoiceSelector({ voice, instruction, voices, onChange }: {
   voice: string;
+  instruction?: string;
   voices: LocalVoice[];
   onChange: (voice: string) => void;
 }) {
@@ -19,7 +20,7 @@ export function LocalVoiceSelector({ voice, voices, onChange }: {
     setError("");
     setBusy(false);
     return () => { request.current += 1; };
-  }, [voice]);
+  }, [voice, instruction]);
 
   async function preview() {
     const id = ++request.current;
@@ -27,7 +28,7 @@ export function LocalVoiceSelector({ voice, voices, onChange }: {
     setError("");
     setAudio(null);
     try {
-      const path = await previewLocalVoice(voice);
+      const path = await previewLocalVoice(voice, instruction);
       if (request.current === id) setAudio(path);
     } catch (e) {
       if (request.current === id) setError(String(e));
@@ -37,7 +38,7 @@ export function LocalVoiceSelector({ voice, voices, onChange }: {
   }
 
   return <div>
-    <label>本机中文音色
+    <label>本机配音引擎与中文音色
       <select value={voice} onChange={e => onChange(e.target.value)} disabled={voices.length === 0}>
         {voices.length === 0 && <option value={voice}>未找到本机中文音色</option>}
         {voices.map(item => <option key={item.name} value={item.name}>
@@ -45,7 +46,7 @@ export function LocalVoiceSelector({ voice, voices, onChange }: {
         </option>)}
       </select>
     </label>
-    <p className="field-help">配音由 macOS 本机合成，不调用语音云服务；AI 写稿仍会通过配置的 DeepSeek API 处理文本。字幕时间依据实测音频时长估算，可能有少量偏差。</p>
+    <p className="field-help">qwen3: 开头为本机Qwen3-TTS/MLX情绪音色，需完整安装权重；其他音色为显式选择的macOS say。Qwen失败不回退say，不调用语音云服务；AI 写稿仍会通过配置的 DeepSeek API 处理文本。字幕时间依据实测音频时长估算，可能有少量偏差。</p>
     <button type="button" onClick={() => void preview()} disabled={busy || voices.length === 0}>
       {busy ? "正在生成试听…" : "试听所选音色"}
     </button>

@@ -9,8 +9,13 @@ pub struct AppConfig {
     /// "best" | "1080" | "720"
     #[serde(default = "default_video_quality")]
     pub video_quality: String,
+    /// Reject unusually short YFSP downloads that are likely previews. Zero disables the length check.
+    #[serde(default = "default_yfsp_min_duration_secs")]
+    pub yfsp_min_duration_secs: u32,
     #[serde(default = "default_tts_voice")]
     pub tts_voice: String,
+    #[serde(default = "default_tts_instruction")]
+    pub tts_instruction: String,
     /// "mute" | "duck"
     #[serde(default = "default_original_audio_mode")]
     pub original_audio_mode: String,
@@ -52,12 +57,19 @@ fn default_video_quality() -> String {
     "best".to_string()
 }
 
+fn default_yfsp_min_duration_secs() -> u32 {
+    600
+}
+
 fn default_source_caption_mask() -> u32 {
     18
 }
 
 fn default_tts_voice() -> String {
-    "Tingting".to_string()
+    "qwen3:Uncle_Fu".to_string()
+}
+fn default_tts_instruction() -> String {
+    crate::services::tts::DEFAULT_INSTRUCTION.into()
 }
 
 fn default_original_audio_mode() -> String {
@@ -104,7 +116,9 @@ impl Default for AppConfig {
             output_dir: default_output_dir(),
             cookies_browser: String::new(),
             video_quality: default_video_quality(),
+            yfsp_min_duration_secs: default_yfsp_min_duration_secs(),
             tts_voice: default_tts_voice(),
+            tts_instruction: default_tts_instruction(),
             original_audio_mode: default_original_audio_mode(),
             duck_db: default_duck_db(),
             source_caption_mask_percent: default_source_caption_mask(),

@@ -32,10 +32,6 @@ pub enum YtdlpError {
 
 pub struct DownloadOutput {
     pub video_path: PathBuf,
-    pub subtitle_path: Option<PathBuf>,
-    /// Languages the platform offered, so a failure can explain itself.
-    pub subtitle_languages: Vec<String>,
-    pub subtitle_error: Option<String>,
     pub title: String,
 }
 
@@ -247,26 +243,32 @@ fn directory_bytes(path: &Path) -> u64 {
         .unwrap_or(0)
 }
 
-/// The download step owns 0–90% of the ingest, the subtitle step the rest, so the
-/// bar never walks backwards when the video finishes and subtitles start.
+/// Each persisted stage has its own 0–100% progress range.
 #[derive(Clone, Copy)]
 struct ProgressWindow {
     from: f64,
     to: f64,
+    stage: &'static str,
 }
 
 impl ProgressWindow {
     const VIDEO: Self = Self {
         from: 0.0,
-        to: 90.0,
+        to: 100.0,
+        stage: "download",
     };
     const SUBTITLE: Self = Self {
-        from: 92.0,
+        from: 0.0,
         to: 100.0,
+        stage: "download_subtitle",
     };
 
     fn start(&self) -> f64 {
         self.from
+    }
+
+    fn stage(&self) -> &'static str {
+        self.stage
     }
 
     fn map(&self, percent: f64) -> f64 {
@@ -362,7 +364,7 @@ fn run_ytdlp_with_progress(
                             task_events::emit_progress(
                                 app,
                                 task_id,
-                                "download",
+                                window.stage(),
                                 last_percent,
                                 progress.message,
                             );
@@ -373,7 +375,7 @@ fn run_ytdlp_with_progress(
                             task_events::emit_progress(
                                 app,
                                 task_id,
-                                "download",
+                                window.stage(),
                                 last_percent,
                                 humanize_ytdlp_line(&text),
                             );
@@ -545,7 +547,7 @@ fn run_ytdlp_with_progress_retry(
             task_events::emit_progress(
                 app,
                 task_id,
-                "download",
+                window.stage(),
                 window.start(),
                 "网络分片连续 90 秒无响应，正在从断点自动重试...",
             );
@@ -555,7 +557,7 @@ fn run_ytdlp_with_progress_retry(
             task_events::emit_progress(
                 app,
                 task_id,
-                "download",
+                window.stage(),
                 window.start(),
                 "一帆服务器的 TLS 连接中断，正在自动重试...",
             );
@@ -565,7 +567,7 @@ fn run_ytdlp_with_progress_retry(
             task_events::emit_progress(
                 app,
                 task_id,
-                "download",
+                window.stage(),
                 window.start(),
                 "无法读取浏览器 Cookie，正在不使用 Cookie 重试...",
             );
@@ -699,6 +701,12 @@ fn parse_subtitle_languages(stdout: &str) -> Vec<String> {
     languages
 }
 
+fn downloaded_subtitle_path(attempt_dir: &Path, succeeded: bool) -> Option<PathBuf> {
+    succeeded
+        .then(|| jobs::find_subtitle_in_dir(attempt_dir, "source"))
+        .flatten()
+}
+
 fn download_subtitles_for_target(
     app: &AppHandle,
     platform: VideoPlatform,
@@ -711,8 +719,17 @@ fn download_subtitles_for_target(
         return Ok(SubtitleFetch::empty());
     }
 
-    std::fs::create_dir_all(job_dir)?;
-    let output_template = job_dir.join("source.%(ext)s");
+    // A retry must only inspect subtitles produced by this exact invocation.
+    // Previous sidecars may belong to another source or an earlier failed run.
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let attempt_dir = job_dir
+        .join("subtitle-attempts")
+        .join(format!("{}-{nonce}", std::process::id()));
+    std::fs::create_dir_all(&attempt_dir)?;
+    let output_template = attempt_dir.join("source.%(ext)s");
     let output_str = output_template.to_string_lossy();
     let task_id = options.task_id.as_deref();
     let cookies = cookies_browser_for_platform(platform, options.cookies_browser.as_deref());
@@ -742,13 +759,19 @@ fn download_subtitles_for_target(
     sub_args.extend(playlist_args.iter().cloned());
     sub_args.push(download_url.to_string());
 
-    task_events::emit_progress(app, task_id, "download", 92.0, "正在拉取平台字幕...");
+    task_events::emit_progress(
+        app,
+        task_id,
+        "download_subtitle",
+        0.0,
+        "正在拉取平台字幕...",
+    );
     let subtitle_result = run_ytdlp_with_progress_retry(
         app,
         task_id,
         &sub_args,
         ProgressWindow::SUBTITLE,
-        Some(job_dir),
+        Some(&attempt_dir),
     );
     let mut platform_languages = Vec::new();
     let mut error = None;
@@ -762,11 +785,10 @@ fn download_subtitles_for_target(
         }
     }
 
-    let canonical = job_dir.join("source.mp4");
-    let path = jobs::relocate_downloaded_subtitles(&canonical, job_dir)
-        .ok()
-        .flatten()
-        .or_else(|| jobs::find_subtitle_in_dir(job_dir, "source"));
+    let path = downloaded_subtitle_path(&attempt_dir, error.is_none());
+    if path.is_none() {
+        let _ = std::fs::remove_dir_all(&attempt_dir);
+    }
     Ok(SubtitleFetch {
         path,
         platform_languages,
@@ -933,22 +955,10 @@ pub fn download_into_job(
         }
     }
 
-    let subtitle = download_subtitles_for_target(
-        app,
-        platform,
-        download_url,
-        &playlist_args,
-        job_dir,
-        &options,
-    )?;
-
-    task_events::emit_progress(app, task_id, "download", 100.0, "下载完成");
+    task_events::emit_progress(app, task_id, "download", 100.0, "原片下载完成");
 
     Ok(DownloadOutput {
         video_path: canonical,
-        subtitle_path: subtitle.path,
-        subtitle_languages: subtitle.platform_languages,
-        subtitle_error: subtitle.error,
         title,
     })
 }
@@ -979,6 +989,31 @@ fn find_latest_video(dir: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn subtitle_retry_never_selects_an_older_attempt() {
+        let root = std::env::temp_dir().join(format!(
+            "vc-subtitle-attempt-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let old = root.join("old");
+        let fresh = root.join("fresh");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::create_dir_all(&fresh).unwrap();
+        std::fs::write(old.join("source.zh.srt"), b"old").unwrap();
+        assert!(downloaded_subtitle_path(&fresh, true).is_none());
+        std::fs::write(fresh.join("source.en.srt"), b"fresh").unwrap();
+        assert_eq!(
+            downloaded_subtitle_path(&fresh, true),
+            Some(fresh.join("source.en.srt"))
+        );
+        assert!(downloaded_subtitle_path(&fresh, false).is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn yfsp_lets_yt_dlp_pick_formats() {
@@ -1077,8 +1112,8 @@ mod tests {
     #[test]
     fn progress_windows_keep_the_bar_moving_forward() {
         assert_eq!(ProgressWindow::VIDEO.map(0.0), 0.0);
-        assert_eq!(ProgressWindow::VIDEO.map(100.0), 90.0);
-        assert_eq!(ProgressWindow::SUBTITLE.map(0.0), 92.0);
+        assert_eq!(ProgressWindow::VIDEO.map(100.0), 100.0);
+        assert_eq!(ProgressWindow::SUBTITLE.map(0.0), 0.0);
         assert_eq!(ProgressWindow::SUBTITLE.map(100.0), 100.0);
     }
 

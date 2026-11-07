@@ -42,6 +42,22 @@ impl AppState {
         lock.lock_owned().await
     }
 
+    /// Small metadata actions should fail visibly rather than wait behind a
+    /// long AI/render command with no indication that they were ever received.
+    pub fn try_lock_task(&self, task_id: &str) -> Result<OwnedMutexGuard<()>, String> {
+        let lock = self
+            .task_locks
+            .lock()
+            .map_err(|_| "任务锁状态不可用".to_string())?
+            .entry(task_id.to_string())
+            .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+            .clone();
+        lock.try_lock_owned().map_err(|_| {
+            "该任务已有生成、评审或渲染正在执行，不能同时开始另一操作。请等待当前操作结束后重试；没有提交重复请求，也不会覆盖稿件。"
+                .into()
+        })
+    }
+
     pub async fn acquire_download(&self) -> Result<OwnedSemaphorePermit, String> {
         self.download_slots
             .clone()

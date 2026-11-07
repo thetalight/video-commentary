@@ -19,8 +19,8 @@ pub fn run() {
             // Tauri excludes dot-directories from recursive globs on macOS.
             app.asset_protocol_scope()
                 .allow_directory(inbox.join(".voice-previews"), true)?;
-            let _ = services::task_store::recover_interrupted();
             let _ = services::task_store::bootstrap_existing_tasks();
+            let _ = services::task_store::recover_interrupted();
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -30,17 +30,26 @@ pub fn run() {
             commands::pipeline::refetch_subtitles,
             commands::pipeline::delete_job,
             commands::pipeline::reveal_path,
+            commands::pipeline::reveal_in_finder,
             commands::episode::episode_exclusions,
+            commands::episode::save_episode_exclusions,
+            commands::episode::migrate_episode,
+            commands::episode::episode_migration_status,
             commands::episode::load_episode,
             commands::episode::generate_episode,
             commands::episode::save_episode,
             commands::episode::review_episode,
+            commands::episode::import_reviewed_episode,
             commands::episode::render_episode,
+            commands::episode::preview_episode_narration,
+            commands::episode::detect_episode_scenes,
+            commands::episode::save_episode_story,
             commands::shorts::load_shorts,
             commands::shorts::generate_shorts,
             commands::shorts::rewrite_short,
             commands::shorts::render_short,
             commands::settings::get_settings,
+            commands::settings::qwen_tts_ready,
             commands::settings::preview_local_voice,
             commands::settings::list_local_voices,
             commands::settings::save_settings,

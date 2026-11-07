@@ -56,7 +56,7 @@ export function IngestProgress({ status, progress }: StatusStepperProps) {
       <div className="panel-intro">
         <h2>正在准备素材</h2>
         <p>
-          下载视频并获取字幕：先找平台独立字幕，没有再找视频内封字幕；两种都没有就放弃这个视频。
+          下载视频并获取字幕：先找平台独立字幕，再找视频内封字幕；两种都没有时，按设置尝试本机语音转写。
         </p>
       </div>
       <StatusStepper status={status} progress={progress} />
